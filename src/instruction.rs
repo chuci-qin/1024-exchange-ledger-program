@@ -142,20 +142,27 @@ pub enum LedgerInstruction {
 
     /// 清算 (原子操作)
     /// 1. 验证清算条件 (mark_price vs liquidation_price)
-    /// 2. CPI 调用 Vault.liquidatePosition
-    /// 3. 关闭 Position
-    /// 4. 创建 TradeRecord
+    /// 2. CPI 调用 Vault.LiquidatePosition (更新用户账户 + 转移罚金到 Insurance Fund)
+    /// 3. CPI 调用 Fund.AddLiquidationIncome (更新保险基金统计)
+    /// 4. CPI 调用 Fund.CoverShortfall (如有穿仓)
+    /// 5. 关闭 Position
+    /// 6. 更新 UserStats
     ///
     /// Accounts:
     /// 0. `[signer]` Liquidator (can be anyone)
     /// 1. `[writable]` Position PDA
     /// 2. `[writable]` UserAccount (Vault)
-    /// 3. `[writable]` VaultConfig
-    /// 4. `[writable]` InsuranceFund
-    /// 5. `[writable]` LedgerConfig
-    /// 6. `[writable]` UserStats PDA
-    /// 7. `[writable]` TradeRecord PDA
-    /// 8. `[]` Vault Program
+    /// 3. `[]` VaultConfig
+    /// 4. `[writable]` LedgerConfig
+    /// 5. `[writable]` UserStats PDA
+    /// 6. `[]` Vault Program
+    /// 7. `[writable]` Vault Token Account (用于罚金转出)
+    /// 8. `[]` Fund Program
+    /// 9. `[writable]` Insurance Fund Account (Fund Program)
+    /// 10. `[writable]` InsuranceFundConfig (Fund Program)
+    /// 11. `[writable]` Insurance Fund Vault (接收罚金)
+    /// 12. `[writable]` Counterparty Vault (穿仓时接收覆盖)
+    /// 13. `[]` Token Program
     Liquidate {
         user: Pubkey,
         market_index: u8,

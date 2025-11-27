@@ -507,9 +507,9 @@ fn process_execute_trade_batch(
         return Err(LedgerError::InsufficientSignatures.into());
     }
 
-    // 验证数据哈希
-    let computed_hash = compute_hash(&trades.try_to_vec()?);
-    if trade_batch.data_hash != computed_hash {
+    // 验证数据哈希 (使用 batch_id 防止重放攻击)
+    let trades_data = trades.try_to_vec()?;
+    if !verify_batch_hash(program_id, batch_id, &trades_data, &trade_batch.data_hash) {
         return Err(LedgerError::InvalidDataHash.into());
     }
 
@@ -900,6 +900,8 @@ fn process_liquidate(
     let ledger_config_info = next_account_info(account_info_iter)?;
     let user_stats_info = next_account_info(account_info_iter)?;
     let _vault_program = next_account_info(account_info_iter)?;
+    // Vault Token Account for liquidation penalty transfer
+    let vault_token_account = next_account_info(account_info_iter)?;
     // Fund Program accounts for insurance fund operations
     let fund_program = next_account_info(account_info_iter)?;
     let insurance_fund_account = next_account_info(account_info_iter)?;
@@ -913,6 +915,8 @@ fn process_liquidate(
     assert_writable(user_account_info)?;
     assert_writable(ledger_config_info)?;
     assert_writable(user_stats_info)?;
+    assert_writable(vault_token_account)?;
+    assert_writable(insurance_vault)?;
 
     // 读取配置
     let mut ledger_config = deserialize_account::<LedgerConfig>(&ledger_config_info.data.borrow())?;
@@ -962,20 +966,31 @@ fn process_liquidate(
     let bump_slice = [ledger_config_bump];
     let signer_seeds = &[&[b"ledger_config".as_ref(), bump_slice.as_ref()][..]];
     
-    // CPI 1: 更新用户账户 (Vault Program)
+    // CPI 1: 更新用户账户 + 转移清算罚金到 Insurance Fund (Vault Program)
+    // 这个 CPI 会执行实际的 Token Transfer: Vault Token Account -> Insurance Fund Vault
     cpi::liquidate_position(
         &ledger_config.vault_program,
         vault_config_info.clone(),
         user_account_info.clone(),
         ledger_config_info.clone(),
+        vault_token_account.clone(),
+        insurance_vault.clone(),
+        token_program.clone(),
         margin,
         user_remainder,
+        liquidation_penalty,
         signer_seeds,
     )?;
     
-    msg!("CPI: Liquidate user account - margin={}, remainder={}", margin, user_remainder);
+    msg!(
+        "CPI: Liquidate user account - margin={}, remainder={}, penalty={}",
+        margin,
+        user_remainder,
+        liquidation_penalty
+    );
     
-    // CPI 2: 添加清算罚金到保险基金 (Fund Program)
+    // CPI 2: 记录清算罚金到保险基金统计 (Fund Program)
+    // 注意: Token 已经在 CPI 1 中转移完成，这里只是更新统计
     if liquidation_penalty > 0 {
         cpi::add_liquidation_income(
             fund_program.key,
@@ -985,7 +1000,7 @@ fn process_liquidate(
             liquidation_penalty as i64,
             signer_seeds,
         )?;
-        msg!("CPI: Liquidation penalty {} added to insurance fund", liquidation_penalty);
+        msg!("CPI: Liquidation penalty {} recorded in insurance fund stats", liquidation_penalty);
     }
     
     // CPI 3: 覆盖穿仓 (Fund Program)
