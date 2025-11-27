@@ -471,21 +471,48 @@ fn process_confirm_trade_batch(
     Ok(())
 }
 
+/// ExecuteTradeBatch 账户布局:
+/// 0. `[signer]` Relayer
+/// 1. `[writable]` TradeBatch PDA
+/// 2. `[]` RelayerConfig
+/// 3. `[writable]` LedgerConfig
+/// 4. `[]` VaultConfig
+/// 5. `[]` Vault Program
+/// 6. `[]` Ledger Program (self, for CPI caller verification)
+/// 7. `[]` System Program
+/// 8. `[writable]` Insurance Fund (for close positions - optional, can be SystemProgram if no closes)
+/// 
+/// 然后是每笔交易的账户 (每笔交易 3 个账户):
+/// For trade i:
+///   9 + i*3 + 0: `[writable]` Position PDA
+///   9 + i*3 + 1: `[writable]` UserAccount (Vault)
+///   9 + i*3 + 2: `[writable]` UserStats PDA
 fn process_execute_trade_batch(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     batch_id: u64,
     trades: Vec<TradeData>,
 ) -> ProgramResult {
+    // 解析共享账户
     let account_info_iter = &mut accounts.iter();
     let relayer = next_account_info(account_info_iter)?;
     let trade_batch_info = next_account_info(account_info_iter)?;
     let relayer_config_info = next_account_info(account_info_iter)?;
     let ledger_config_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program = next_account_info(account_info_iter)?;
+    let ledger_program_info = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+    let insurance_fund_info = next_account_info(account_info_iter)?;
 
     assert_signer(relayer)?;
     assert_writable(trade_batch_info)?;
     assert_writable(ledger_config_info)?;
+
+    // 验证 Ledger Program 地址
+    if ledger_program_info.key != program_id {
+        return Err(LedgerError::InvalidProgramId.into());
+    }
 
     // 验证 Relayer 授权
     let relayer_config = deserialize_account::<RelayerConfig>(&relayer_config_info.data.borrow())?;
@@ -517,34 +544,258 @@ fn process_execute_trade_batch(
     trade_batch.executed = true;
     trade_batch.serialize(&mut &mut trade_batch_info.data.borrow_mut()[..])?;
 
-    // 更新 LedgerConfig 序列号
+    // 读取 LedgerConfig
     let mut ledger_config = deserialize_account::<LedgerConfig>(&ledger_config_info.data.borrow())?;
+    
+    if ledger_config.is_paused {
+        return Err(LedgerError::LedgerPaused.into());
+    }
+
+    // 验证 Vault Program
+    if vault_program.key != &ledger_config.vault_program {
+        return Err(LedgerError::InvalidVaultProgram.into());
+    }
+
+    // 收集剩余账户 (每笔交易的账户)
+    let remaining_accounts: Vec<AccountInfo> = account_info_iter.cloned().collect();
+    
+    // 验证账户数量
+    let expected_accounts = trades.len() * 3; // 每笔交易 3 个账户
+    if remaining_accounts.len() < expected_accounts {
+        msg!(
+            "❌ Insufficient accounts: expected {} for {} trades, got {}",
+            expected_accounts,
+            trades.len(),
+            remaining_accounts.len()
+        );
+        return Err(LedgerError::InsufficientAccounts.into());
+    }
+
+    // 派生 Ledger Config PDA bump 用于 CPI
+    let (_, ledger_config_bump) = Pubkey::find_program_address(
+        &[b"ledger_config"],
+        program_id,
+    );
+
+    msg!("📦 ExecuteTradeBatch: batch_id={}, trades={}", batch_id, trades.len());
 
     // 执行每笔交易
-    for trade in trades.iter() {
-        let _sequence = ledger_config.next_sequence();
-        // TODO: 调用内部开仓/平仓逻辑
-        // 这里简化处理，实际需要传入更多账户
+    for (i, trade) in trades.iter().enumerate() {
+        let sequence = ledger_config.next_sequence();
+        
+        // 获取此交易的账户
+        let base_idx = i * 3;
+        let position_info = &remaining_accounts[base_idx];
+        let user_account_info = &remaining_accounts[base_idx + 1];
+        let user_stats_info = &remaining_accounts[base_idx + 2];
+
+        // 验证 Position PDA
+        let (expected_position_pda, position_bump) = Pubkey::find_program_address(
+            &[b"position", trade.user.as_ref(), &[trade.market_index]],
+            program_id,
+        );
+        if position_info.key != &expected_position_pda {
+            msg!("❌ Trade {}: Invalid position PDA", i);
+            return Err(LedgerError::InvalidAccount.into());
+        }
+
         match trade.trade_type {
             trade_data_type::OPEN => {
-                msg!("Execute OPEN: user={}, market={}, size={}", trade.user, trade.market_index, trade.size_e6);
+                msg!(
+                    "🔵 Trade {} OPEN: user={}, market={}, side={:?}, size={}, price={}, leverage={}",
+                    i, trade.user, trade.market_index, trade.side, trade.size_e6, trade.price_e6, trade.leverage
+                );
+
+                // 验证参数
+                if trade.size_e6 == 0 {
+                    return Err(LedgerError::InvalidTradeAmount.into());
+                }
+                if trade.price_e6 == 0 {
+                    return Err(LedgerError::InvalidPrice.into());
+                }
+                if trade.leverage == 0 || trade.leverage > MAX_LEVERAGE {
+                    return Err(LedgerError::InvalidLeverage.into());
+                }
+
+                // 计算所需保证金和手续费
+                let required_margin = cpi::calculate_required_margin(trade.size_e6, trade.price_e6, trade.leverage)?;
+                let fee = cpi::calculate_fee(trade.size_e6, trade.price_e6, 1_000)?; // 0.1% fee
+
+                // 检查是否是新仓位
+                let is_new_position = position_info.data_len() == 0 || {
+                    let data = position_info.data.borrow();
+                    data.iter().all(|&x| x == 0)
+                };
+
+                if is_new_position {
+                    // 创建新仓位
+                    let rent = Rent::get()?;
+                    let space = Position::SIZE;
+                    let lamports = rent.minimum_balance(space);
+
+                    invoke_signed(
+                        &system_instruction::create_account(
+                            relayer.key,
+                            position_info.key,
+                            lamports,
+                            space as u64,
+                            program_id,
+                        ),
+                        &[relayer.clone(), position_info.clone(), system_program.clone()],
+                        &[&[b"position", trade.user.as_ref(), &[trade.market_index], &[position_bump]]],
+                    )?;
+
+                    let mut position = Position {
+                        discriminator: Position::DISCRIMINATOR,
+                        user: trade.user,
+                        market_index: trade.market_index,
+                        side: trade.side.clone(),
+                        size_e6: trade.size_e6,
+                        entry_price_e6: trade.price_e6,
+                        margin_e6: required_margin,
+                        leverage: trade.leverage,
+                        liquidation_price_e6: 0,
+                        unrealized_pnl_e6: 0,
+                        last_funding_ts: current_ts,
+                        cumulative_funding_e6: 0,
+                        open_order_count: 0,
+                        opened_at: current_ts,
+                        last_update_ts: current_ts,
+                        bump: position_bump,
+                        reserved: [0; 32],
+                    };
+                    position.liquidation_price_e6 = position.calculate_liquidation_price()?;
+                    position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+
+                    msg!("  ✅ New position created");
+                } else {
+                    // 加仓
+                    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+                    if position.side != trade.side {
+                        msg!("❌ Trade {}: Side mismatch (existing: {:?}, new: {:?})", i, position.side, trade.side);
+                        return Err(LedgerError::InvalidPositionSide.into());
+                    }
+                    position.update_entry_price(trade.size_e6, trade.price_e6)?;
+                    position.margin_e6 = checked_add_u64(position.margin_e6, required_margin)?;
+                    position.last_update_ts = current_ts;
+                    position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+
+                    msg!("  ✅ Position increased");
+                }
+
+                // CPI: 锁定保证金
+                let total_to_lock = checked_add_u64(required_margin, fee)?;
+                cpi::lock_margin(
+                    vault_program.key,
+                    vault_config_info.clone(),
+                    user_account_info.clone(),
+                    ledger_program_info.clone(),
+                    total_to_lock,
+                    &[],
+                )?;
+                msg!("  ✅ Margin locked: {} (margin) + {} (fee)", required_margin, fee);
+
+                // 更新统计
                 ledger_config.total_positions_opened += 1;
+                ledger_config.total_fees_collected_e6 = checked_add_u64(ledger_config.total_fees_collected_e6, fee)?;
             }
+            
             trade_data_type::CLOSE => {
-                msg!("Execute CLOSE: user={}, market={}, size={}", trade.user, trade.market_index, trade.size_e6);
+                msg!(
+                    "🔴 Trade {} CLOSE: user={}, market={}, size={}, price={}",
+                    i, trade.user, trade.market_index, trade.size_e6, trade.price_e6
+                );
+
+                // 验证参数
+                if trade.size_e6 == 0 {
+                    return Err(LedgerError::InvalidTradeAmount.into());
+                }
+                if trade.price_e6 == 0 {
+                    return Err(LedgerError::InvalidPrice.into());
+                }
+
+                // 读取仓位
+                let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+                if position.user != trade.user || position.market_index != trade.market_index {
+                    return Err(LedgerError::PositionNotFound.into());
+                }
+                if position.is_empty() {
+                    return Err(LedgerError::PositionNotFound.into());
+                }
+
+                // 计算平仓数量和盈亏
+                let close_size = trade.size_e6.min(position.size_e6);
+                let close_ratio = div_e6(close_size as i64, position.size_e6 as i64)?;
+                let pnl = position.calculate_unrealized_pnl(trade.price_e6)?;
+                let realized_pnl = mul_e6(pnl, close_ratio)?;
+                let margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
+                let fee = cpi::calculate_fee(close_size, trade.price_e6, 1_000)?;
+
+                // 更新仓位
+                if close_size >= position.size_e6 {
+                    position.size_e6 = 0;
+                    position.margin_e6 = 0;
+                    position.entry_price_e6 = 0;
+                    position.liquidation_price_e6 = 0;
+                    position.unrealized_pnl_e6 = 0;
+                } else {
+                    position.size_e6 = checked_sub_u64(position.size_e6, close_size)?;
+                    position.margin_e6 = checked_sub_u64(position.margin_e6, margin_to_release)?;
+                    position.liquidation_price_e6 = position.calculate_liquidation_price()?;
+                }
+                position.last_update_ts = current_ts;
+                position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+
+                // CPI: 平仓结算
+                cpi::close_position_settle(
+                    &ledger_config.vault_program,
+                    vault_config_info.clone(),
+                    user_account_info.clone(),
+                    ledger_config_info.clone(),
+                    margin_to_release,
+                    realized_pnl,
+                    fee,
+                    &[&[b"ledger_config", &[ledger_config_bump]]],
+                )?;
+                msg!("  ✅ Position closed: pnl={}, margin_released={}, fee={}", realized_pnl, margin_to_release, fee);
+
+                // 更新统计
                 ledger_config.total_positions_closed += 1;
+                ledger_config.total_fees_collected_e6 = checked_add_u64(ledger_config.total_fees_collected_e6, fee)?;
             }
-            _ => {}
+            
+            _ => {
+                msg!("⚠️ Trade {}: Unknown trade type {}", i, trade.trade_type);
+            }
         }
+
+        // 更新交易量
         ledger_config.total_volume_e6 = ledger_config
             .total_volume_e6
             .saturating_add((trade.size_e6 as u128 * trade.price_e6 as u128 / 1_000_000) as u64);
+
+        // 更新用户统计
+        if user_stats_info.data_len() > 0 {
+            if let Ok(mut user_stats) = deserialize_account::<UserStats>(&user_stats_info.data.borrow()) {
+                user_stats.total_trades += 1;
+                user_stats.total_volume_e6 = user_stats.total_volume_e6.saturating_add(
+                    (trade.size_e6 as u128 * trade.price_e6 as u128 / 1_000_000) as u64
+                );
+                if user_stats.first_trade_at == 0 {
+                    user_stats.first_trade_at = current_ts;
+                }
+                user_stats.last_trade_at = current_ts;
+                let _ = user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..]);
+            }
+        }
+
+        msg!("  📊 Sequence: {}", sequence);
     }
 
     ledger_config.last_update_ts = current_ts;
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
-    msg!("TradeBatch {} executed with {} trades", batch_id, trades.len());
+    msg!("✅ TradeBatch {} executed successfully with {} trades", batch_id, trades.len());
     Ok(())
 }
 

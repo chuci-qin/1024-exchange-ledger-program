@@ -139,6 +139,10 @@ pub enum LedgerError {
 
     #[error("Already initialized")]
     AlreadyInitialized,
+
+    // === Batch 相关 ===
+    #[error("Insufficient accounts for trade batch")]
+    InsufficientAccounts,
 }
 
 impl From<LedgerError> for ProgramError {

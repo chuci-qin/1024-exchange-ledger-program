@@ -70,12 +70,24 @@ pub enum LedgerInstruction {
 
     /// 执行交易批次 (签名足够后)
     ///
-    /// Accounts:
+    /// 账户布局:
     /// 0. `[signer]` Any authorized Relayer
     /// 1. `[writable]` TradeBatch PDA
     /// 2. `[]` RelayerConfig
     /// 3. `[writable]` LedgerConfig
-    /// 4+ Trade-specific accounts...
+    /// 4. `[]` VaultConfig
+    /// 5. `[]` Vault Program
+    /// 6. `[]` Ledger Program (self)
+    /// 7. `[]` System Program
+    /// 8. `[writable]` Insurance Fund (for close positions, can be SystemProgram if no closes)
+    /// 
+    /// 然后每笔交易需要 3 个账户:
+    /// For trade i (starting from index 9):
+    ///   9 + i*3 + 0: `[writable]` Position PDA (seeds: ["position", user, market_index])
+    ///   9 + i*3 + 1: `[writable]` UserAccount (Vault)
+    ///   9 + i*3 + 2: `[writable]` UserStats PDA
+    ///
+    /// 示例: 2 笔交易需要 9 + 6 = 15 个账户
     ExecuteTradeBatch {
         batch_id: u64,
         trades: Vec<TradeData>,
