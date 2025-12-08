@@ -538,6 +538,195 @@ impl UserStats {
 // Tests
 // ============================================================================
 
+// ============================================================================
+// PredictionMarketPosition (预测市场仓位 PDA) - Phase 2 TODO
+// ============================================================================
+
+/// 预测市场结果类型
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictionOutcome {
+    /// Yes 结果
+    Yes,
+    /// No 结果
+    No,
+}
+
+/// 预测市场仓位状态
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictionMarketPositionStatus {
+    /// 活跃（可交易）
+    Active,
+    /// 已结算（等待领取）
+    Settled,
+    /// 已领取（关闭）
+    Claimed,
+}
+
+/// 预测市场仓位 (PDA)
+/// PDA Seeds: ["prediction_market_position", user, event_id]
+/// 
+/// 预测市场仓位与永续合约仓位的主要区别：
+/// 1. 没有杠杆，1:1 保证金
+/// 2. 结算价格只有 0 或 1（对应 No/Yes 赢）
+/// 3. 有明确的结算时间
+/// 4. 份额代替数量
+/// 
+/// TODO: Phase 2 实现
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct PredictionMarketPosition {
+    /// 账户鉴别器
+    pub discriminator: [u8; 8],
+    /// 用户钱包
+    pub user: Pubkey,
+    /// 事件ID (SHA256 hash of event name, e.g., "US_ELECTION_2024")
+    pub event_id: [u8; 32],
+    /// 预测结果 (Yes/No)
+    pub outcome: PredictionOutcome,
+    /// 持有份额 (e6) - 1 份 = 1 USDC 赢时的收益
+    pub shares_e6: u64,
+    /// 平均买入价格 (e6) - 0.00 ~ 1.00 USD
+    pub avg_price_e6: u64,
+    /// 锁定保证金 (e6) = shares * avg_price
+    pub margin_e6: u64,
+    /// 仓位状态
+    pub status: PredictionMarketPositionStatus,
+    /// 结算价格 (e6) - 0 或 1_000_000
+    pub settlement_price_e6: u64,
+    /// 实现盈亏 (e6) - 结算后计算
+    pub realized_pnl_e6: i64,
+    /// 创建时间
+    pub created_at: i64,
+    /// 结算时间 (0 = 未结算)
+    pub settled_at: i64,
+    /// 领取时间 (0 = 未领取)
+    pub claimed_at: i64,
+    /// Bump
+    pub bump: u8,
+    /// 预留空间
+    pub reserved: [u8; 32],
+}
+
+impl PredictionMarketPosition {
+    pub const DISCRIMINATOR: [u8; 8] = *b"pm_pos__";
+    pub const SIZE: usize = 8 + // discriminator
+        32 + // user
+        32 + // event_id
+        1 + // outcome
+        8 + // shares_e6
+        8 + // avg_price_e6
+        8 + // margin_e6
+        1 + // status
+        8 + // settlement_price_e6
+        8 + // realized_pnl_e6
+        8 + // created_at
+        8 + // settled_at
+        8 + // claimed_at
+        1 + // bump
+        32; // reserved
+
+    /// PDA Seeds prefix: ["prediction_market_position", user, event_id]
+    pub const SEED_PREFIX: &'static [u8] = b"prediction_market_position";
+
+    /// 检查仓位是否为空（可清理）
+    pub fn is_empty(&self) -> bool {
+        self.shares_e6 == 0 || 
+        self.status == PredictionMarketPositionStatus::Claimed
+    }
+
+    /// 检查是否已结算
+    pub fn is_settled(&self) -> bool {
+        self.status == PredictionMarketPositionStatus::Settled ||
+        self.status == PredictionMarketPositionStatus::Claimed
+    }
+
+    /// 计算未实现盈亏（基于当前市场价格）
+    /// 
+    /// 如果用户持有 Yes 份额:
+    ///   PnL = shares * (current_price - avg_price)
+    /// 
+    /// 如果用户持有 No 份额:
+    ///   PnL = shares * ((1 - current_price) - avg_price)
+    ///   Note: No 份额的 avg_price 是买入 No 的价格
+    pub fn calculate_unrealized_pnl(&self, current_price_e6: u64) -> i64 {
+        if self.shares_e6 == 0 {
+            return 0;
+        }
+
+        let shares = self.shares_e6 as i64;
+        let avg_price = self.avg_price_e6 as i64;
+        let current = current_price_e6 as i64;
+
+        // PnL = shares * (current - avg) / 1e6
+        let price_diff = current - avg_price;
+        (shares as i128 * price_diff as i128 / 1_000_000) as i64
+    }
+
+    /// 计算结算盈亏
+    /// 
+    /// 如果预测正确（赢）: PnL = shares * (1 - avg_price)
+    /// 如果预测错误（输）: PnL = -shares * avg_price (损失全部保证金)
+    pub fn calculate_settlement_pnl(&self, winning_outcome: PredictionOutcome) -> i64 {
+        if self.shares_e6 == 0 {
+            return 0;
+        }
+
+        let shares = self.shares_e6 as i64;
+        let avg_price = self.avg_price_e6 as i64;
+
+        if self.outcome == winning_outcome {
+            // 赢了：收益 = 份额 * (1 - 买入价格)
+            let profit_per_share = 1_000_000 - avg_price;
+            (shares as i128 * profit_per_share as i128 / 1_000_000) as i64
+        } else {
+            // 输了：损失 = 份额 * 买入价格 (即全部保证金)
+            -((shares as i128 * avg_price as i128 / 1_000_000) as i64)
+        }
+    }
+}
+
+/// 预测市场事件配置 (全局 PDA)
+/// PDA Seeds: ["prediction_market_event", event_id]
+/// 
+/// TODO: Phase 2 实现
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct PredictionMarketEvent {
+    /// 账户鉴别器
+    pub discriminator: [u8; 8],
+    /// 事件ID (SHA256)
+    pub event_id: [u8; 32],
+    /// 事件名称 (UTF-8, max 64 bytes)
+    pub name: [u8; 64],
+    /// 事件描述 (UTF-8, max 256 bytes)
+    pub description: [u8; 256],
+    /// Yes 份额总供应量 (e6)
+    pub yes_supply_e6: u64,
+    /// No 份额总供应量 (e6)
+    pub no_supply_e6: u64,
+    /// 当前 Yes 价格 (e6) - 由 AMM 或订单簿决定
+    pub yes_price_e6: u64,
+    /// 事件结束时间（结算截止）
+    pub end_time: i64,
+    /// 是否已结算
+    pub is_settled: bool,
+    /// 赢家结果 (None = 未结算)
+    pub winning_outcome: Option<PredictionOutcome>,
+    /// 结算时间
+    pub settled_at: i64,
+    /// 创建者
+    pub creator: Pubkey,
+    /// 创建时间
+    pub created_at: i64,
+    /// Bump
+    pub bump: u8,
+    /// 预留空间
+    pub reserved: [u8; 64],
+}
+
+impl PredictionMarketEvent {
+    pub const DISCRIMINATOR: [u8; 8] = *b"pm_evnt_";
+    pub const SEED_PREFIX: &'static [u8] = b"prediction_market_event";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +853,96 @@ mod tests {
         assert!(config.has_enough_signatures(2));
         assert!(config.has_enough_signatures(3));
         assert!(!config.has_enough_signatures(1));
+    }
+
+    // ========== Prediction Market Tests ==========
+
+    #[test]
+    fn test_prediction_market_position_unrealized_pnl() {
+        let pos = PredictionMarketPosition {
+            discriminator: PredictionMarketPosition::DISCRIMINATOR,
+            user: Pubkey::new_unique(),
+            event_id: [0; 32],
+            outcome: PredictionOutcome::Yes,
+            shares_e6: 100_000_000, // 100 shares
+            avg_price_e6: 600_000,  // $0.60 avg price
+            margin_e6: 60_000_000,  // 100 * 0.60 = $60
+            status: PredictionMarketPositionStatus::Active,
+            settlement_price_e6: 0,
+            realized_pnl_e6: 0,
+            created_at: 0,
+            settled_at: 0,
+            claimed_at: 0,
+            bump: 255,
+            reserved: [0; 32],
+        };
+
+        // Current price = $0.70 -> PnL = 100 * (0.70 - 0.60) = +$10
+        let pnl = pos.calculate_unrealized_pnl(700_000);
+        assert_eq!(pnl, 10_000_000); // $10 in e6
+
+        // Current price = $0.50 -> PnL = 100 * (0.50 - 0.60) = -$10
+        let pnl = pos.calculate_unrealized_pnl(500_000);
+        assert_eq!(pnl, -10_000_000); // -$10 in e6
+    }
+
+    #[test]
+    fn test_prediction_market_position_settlement_pnl() {
+        let pos = PredictionMarketPosition {
+            discriminator: PredictionMarketPosition::DISCRIMINATOR,
+            user: Pubkey::new_unique(),
+            event_id: [0; 32],
+            outcome: PredictionOutcome::Yes,
+            shares_e6: 100_000_000, // 100 shares
+            avg_price_e6: 600_000,  // $0.60 avg price
+            margin_e6: 60_000_000,  // $60 margin
+            status: PredictionMarketPositionStatus::Active,
+            settlement_price_e6: 0,
+            realized_pnl_e6: 0,
+            created_at: 0,
+            settled_at: 0,
+            claimed_at: 0,
+            bump: 255,
+            reserved: [0; 32],
+        };
+
+        // Yes wins: PnL = 100 * (1.00 - 0.60) = +$40
+        let pnl = pos.calculate_settlement_pnl(PredictionOutcome::Yes);
+        assert_eq!(pnl, 40_000_000); // $40 in e6
+
+        // No wins: PnL = -100 * 0.60 = -$60 (lose all margin)
+        let pnl = pos.calculate_settlement_pnl(PredictionOutcome::No);
+        assert_eq!(pnl, -60_000_000); // -$60 in e6
+    }
+
+    #[test]
+    fn test_prediction_market_position_is_empty() {
+        let mut pos = PredictionMarketPosition {
+            discriminator: PredictionMarketPosition::DISCRIMINATOR,
+            user: Pubkey::new_unique(),
+            event_id: [0; 32],
+            outcome: PredictionOutcome::Yes,
+            shares_e6: 100_000_000,
+            avg_price_e6: 600_000,
+            margin_e6: 60_000_000,
+            status: PredictionMarketPositionStatus::Active,
+            settlement_price_e6: 0,
+            realized_pnl_e6: 0,
+            created_at: 0,
+            settled_at: 0,
+            claimed_at: 0,
+            bump: 255,
+            reserved: [0; 32],
+        };
+
+        assert!(!pos.is_empty()); // Has shares, active
+
+        pos.shares_e6 = 0;
+        assert!(pos.is_empty()); // No shares
+
+        pos.shares_e6 = 100_000_000;
+        pos.status = PredictionMarketPositionStatus::Claimed;
+        assert!(pos.is_empty()); // Already claimed
     }
 }
 
