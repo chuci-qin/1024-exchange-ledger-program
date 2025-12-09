@@ -342,6 +342,84 @@ fn process_initialize_user_stats(
 }
 
 // ============================================================================
+// 辅助函数：自动创建 UserStats
+// ============================================================================
+
+/// 确保 UserStats 账户存在，如果不存在则自动创建
+/// 
+/// 返回: Ok(true) 如果创建了新账户，Ok(false) 如果已存在
+fn ensure_user_stats_exists<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    user_wallet: &Pubkey,
+    user_stats_info: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+) -> Result<bool, ProgramError> {
+    // 检查账户是否已存在
+    let is_empty = user_stats_info.data_len() == 0 || {
+        let data = user_stats_info.data.borrow();
+        data.iter().all(|&x| x == 0)
+    };
+    
+    if !is_empty {
+        // 账户已存在，验证 discriminator
+        let data = user_stats_info.data.borrow();
+        if data.len() >= 8 && &data[0..8] == UserStats::DISCRIMINATOR.as_slice() {
+            return Ok(false); // 已存在，无需创建
+        }
+    }
+    
+    // 验证 PDA
+    let (user_stats_pda, bump) = Pubkey::find_program_address(
+        &[b"user_stats", user_wallet.as_ref()],
+        program_id,
+    );
+    if user_stats_info.key != &user_stats_pda {
+        msg!("❌ Invalid UserStats PDA: expected {}, got {}", user_stats_pda, user_stats_info.key);
+        return Err(LedgerError::InvalidAccount.into());
+    }
+    
+    // 创建账户
+    let rent = Rent::get()?;
+    let space = UserStats::SIZE;
+    let lamports = rent.minimum_balance(space);
+    
+    msg!("✨ Auto-creating UserStats for user {}", user_wallet);
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            payer.key,
+            user_stats_info.key,
+            lamports,
+            space as u64,
+            program_id,
+        ),
+        &[payer.clone(), user_stats_info.clone(), system_program.clone()],
+        &[&[b"user_stats", user_wallet.as_ref(), &[bump]]],
+    )?;
+    
+    // 初始化数据
+    let user_stats = UserStats {
+        discriminator: UserStats::DISCRIMINATOR,
+        user: *user_wallet,
+        total_trades: 0,
+        total_volume_e6: 0,
+        total_realized_pnl_e6: 0,
+        total_fees_paid_e6: 0,
+        total_funding_paid_e6: 0,
+        total_liquidations: 0,
+        first_trade_at: 0,
+        last_trade_at: 0,
+        bump,
+    };
+    
+    user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
+    msg!("✅ UserStats auto-created for {}", user_wallet);
+    
+    Ok(true) // 新创建
+}
+
+// ============================================================================
 // 多签指令处理
 // ============================================================================
 
@@ -774,7 +852,16 @@ fn process_execute_trade_batch(
             .total_volume_e6
             .saturating_add((trade.size_e6 as u128 * trade.price_e6 as u128 / 1_000_000) as u64);
 
-        // 更新用户统计
+        // 自动创建 UserStats (如果不存在)
+        let _ = ensure_user_stats_exists(
+            program_id,
+            relayer,
+            &trade.user,
+            user_stats_info,
+            system_program,
+        );
+
+        // 更新用户统计 (现在保证存在)
         if user_stats_info.data_len() > 0 {
             if let Ok(mut user_stats) = deserialize_account::<UserStats>(&user_stats_info.data.borrow()) {
                 user_stats.total_trades += 1;
@@ -978,20 +1065,30 @@ fn process_open_position(
     ledger_config.last_update_ts = current_ts;
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
-    // 更新用户统计
+    // 自动创建 UserStats (如果不存在)
+    let _ = ensure_user_stats_exists(
+        program_id,
+        relayer,
+        &user,
+        user_stats_info,
+        system_program,
+    );
+
+    // 更新用户统计 (现在保证存在)
     if user_stats_info.data_len() > 0 {
-        let mut user_stats = deserialize_account::<UserStats>(&user_stats_info.data.borrow())?;
-        user_stats.total_trades += 1;
-        user_stats.total_volume_e6 = checked_add_u64(
-            user_stats.total_volume_e6,
-            (size_e6 as u128 * price_e6 as u128 / 1_000_000) as u64,
-        )?;
-        user_stats.total_fees_paid_e6 = checked_add_u64(user_stats.total_fees_paid_e6, fee)?;
-        if user_stats.first_trade_at == 0 {
-            user_stats.first_trade_at = current_ts;
+        if let Ok(mut user_stats) = deserialize_account::<UserStats>(&user_stats_info.data.borrow()) {
+            user_stats.total_trades += 1;
+            user_stats.total_volume_e6 = checked_add_u64(
+                user_stats.total_volume_e6,
+                (size_e6 as u128 * price_e6 as u128 / 1_000_000) as u64,
+            )?;
+            user_stats.total_fees_paid_e6 = checked_add_u64(user_stats.total_fees_paid_e6, fee)?;
+            if user_stats.first_trade_at == 0 {
+                user_stats.first_trade_at = current_ts;
+            }
+            user_stats.last_trade_at = current_ts;
+            user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
         }
-        user_stats.last_trade_at = current_ts;
-        user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
     }
 
     msg!("OpenPosition completed: batch_id={}, margin_locked={}, fee={}", batch_id, total_to_lock, fee);
