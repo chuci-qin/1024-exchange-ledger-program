@@ -62,49 +62,57 @@ pub const TRADE_BATCH_EXPIRY_SECONDS: i64 = 60;
 // LedgerConfig (全局配置)
 // ============================================================================
 
+/// LedgerConfig (全局配置)
+/// 
+/// ⚠️ 重要：此结构必须与链上已部署的账户数据格式完全匹配！
+/// 链上账户大小: 243 bytes
+/// 
+/// 修复记录 (2025-12-10):
+/// - 移除 delegation_program 字段以匹配链上数据格式
+/// - delegation_program 功能暂时不使用，后续如需添加需要数据迁移
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
 pub struct LedgerConfig {
-    /// 账户鉴别器
+    /// 账户鉴别器 (8 bytes)
     pub discriminator: [u8; 8],
-    /// 管理员
+    /// 管理员 (32 bytes)
     pub admin: Pubkey,
-    /// Vault Program ID (用户资金管理)
+    /// Vault Program ID (用户资金管理) (32 bytes)
     pub vault_program: Pubkey,
-    /// Fund Program ID (保险基金/系统资金管理)
+    /// Fund Program ID (保险基金/系统资金管理) (32 bytes)
     pub fund_program: Pubkey,
-    /// Delegation Program ID (可选)
-    pub delegation_program: Option<Pubkey>,
-    /// 全局序列号 (用于交易排序)
+    /// 全局序列号 (用于交易排序) (8 bytes)
     pub global_sequence: u64,
-    /// 总开仓数
+    /// 总开仓数 (8 bytes)
     pub total_positions_opened: u64,
-    /// 总平仓数
+    /// 总平仓数 (8 bytes)
     pub total_positions_closed: u64,
-    /// 总成交量 (USDC, e6)
+    /// 总成交量 (USDC, e6) (8 bytes)
     pub total_volume_e6: u64,
-    /// 总手续费 (e6)
+    /// 总手续费 (e6) (8 bytes)
     pub total_fees_collected_e6: u64,
-    /// 总清算数
+    /// 总清算数 (8 bytes)
     pub total_liquidations: u64,
-    /// 总 ADL 次数
+    /// 总 ADL 次数 (8 bytes)
     pub total_adl_count: u64,
-    /// 是否暂停
+    /// 是否暂停 (1 byte)
     pub is_paused: bool,
-    /// Bump
+    /// Bump (1 byte)
     pub bump: u8,
-    /// 创建时间
+    /// 创建时间 (8 bytes)
     pub created_at: i64,
-    /// 最后更新时间
+    /// 最后更新时间 (8 bytes)
     pub last_update_ts: i64,
+    /// 预留空间 (65 bytes) - 用于未来扩展
+    pub reserved: [u8; 65],
 }
 
 impl LedgerConfig {
     pub const DISCRIMINATOR: [u8; 8] = *b"ledgcfg_";
+    /// 链上账户大小 - 必须与已部署账户匹配！
     pub const SIZE: usize = 8 + // discriminator
         32 + // admin
         32 + // vault_program
         32 + // fund_program
-        1 + 32 + // delegation_program (Option)
         8 + // global_sequence
         8 + // total_positions_opened
         8 + // total_positions_closed
@@ -116,7 +124,8 @@ impl LedgerConfig {
         1 + // bump
         8 + // created_at
         8 + // last_update_ts
-        32; // reserved (reduced due to fund_program added)
+        65; // reserved
+    // Total: 243 bytes (与链上账户匹配)
 
     pub fn next_sequence(&mut self) -> u64 {
         let seq = self.global_sequence;

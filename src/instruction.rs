@@ -26,9 +26,7 @@ pub enum LedgerInstruction {
     /// 2. `[]` Vault Program
     /// 3. `[]` Fund Program
     /// 4. `[]` System Program
-    Initialize {
-        delegation_program: Option<Pubkey>,
-    },
+    Initialize,
 
     /// 初始化多 Relayer 配置
     ///

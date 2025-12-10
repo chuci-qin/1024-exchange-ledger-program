@@ -39,9 +39,9 @@ pub fn process_instruction(
 
     match instruction {
         // 初始化
-        LedgerInstruction::Initialize { delegation_program } => {
+        LedgerInstruction::Initialize => {
             msg!("Instruction: Initialize");
-            process_initialize(program_id, accounts, delegation_program)
+            process_initialize(program_id, accounts)
         }
         LedgerInstruction::InitializeRelayers { relayers, required_signatures } => {
             msg!("Instruction: InitializeRelayers");
@@ -160,7 +160,6 @@ pub fn process_instruction(
 fn process_initialize(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    delegation_program: Option<Pubkey>,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
     let admin = next_account_info(account_info_iter)?;
@@ -201,7 +200,6 @@ fn process_initialize(
         admin: *admin.key,
         vault_program: *vault_program.key,
         fund_program: *fund_program.key,
-        delegation_program,
         global_sequence: 0,
         total_positions_opened: 0,
         total_positions_closed: 0,
@@ -213,6 +211,7 @@ fn process_initialize(
         bump,
         created_at: current_ts,
         last_update_ts: current_ts,
+        reserved: [0u8; 65],
     };
 
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
@@ -761,15 +760,15 @@ fn process_execute_trade_batch(
                     msg!("  ✅ Position increased");
                 }
 
-                // CPI: 锁定保证金
+                // CPI: 锁定保证金 (使用 LedgerConfig PDA 作为 caller)
                 let total_to_lock = checked_add_u64(required_margin, fee)?;
                 cpi::lock_margin(
                     vault_program.key,
                     vault_config_info.clone(),
                     user_account_info.clone(),
-                    ledger_program_info.clone(),
+                    ledger_config_info.clone(),  // 使用 LedgerConfig PDA 作为 caller
                     total_to_lock,
-                    &[],
+                    &[&[b"ledger_config", &[ledger_config_bump]]],  // PDA 签名
                 )?;
                 msg!("  ✅ Margin locked: {} (margin) + {} (fee)", required_margin, fee);
 
@@ -863,7 +862,13 @@ fn process_execute_trade_batch(
 
         // 更新用户统计 (现在保证存在)
         if user_stats_info.data_len() > 0 {
-            if let Ok(mut user_stats) = deserialize_account::<UserStats>(&user_stats_info.data.borrow()) {
+            // 先读取数据到局部变量，释放借用
+            let user_stats_result = {
+                let data = user_stats_info.data.borrow();
+                deserialize_account::<UserStats>(&data)
+            };
+            
+            if let Ok(mut user_stats) = user_stats_result {
                 user_stats.total_trades += 1;
                 user_stats.total_volume_e6 = user_stats.total_volume_e6.saturating_add(
                     (trade.size_e6 as u128 * trade.price_e6 as u128 / 1_000_000) as u64
@@ -1048,9 +1053,9 @@ fn process_open_position(
         vault_program.key,
         vault_config_info.clone(),
         user_account_info.clone(),
-        ledger_program_info.clone(), // 传递 Ledger Program 本身作为 caller
+        ledger_config_info.clone(),  // 使用 LedgerConfig PDA 作为 caller
         total_to_lock,
-        &[],  // 不需要签名种子，因为 caller 不是 PDA
+        &[&[b"ledger_config", &[ledger_config_bump]]],  // PDA 签名
     )?;
     
     msg!("CPI: Locked margin {} + fee {}", required_margin, fee);
@@ -1076,7 +1081,13 @@ fn process_open_position(
 
     // 更新用户统计 (现在保证存在)
     if user_stats_info.data_len() > 0 {
-        if let Ok(mut user_stats) = deserialize_account::<UserStats>(&user_stats_info.data.borrow()) {
+        // 先读取数据到局部变量，释放借用
+        let user_stats_result = {
+            let data = user_stats_info.data.borrow();
+            deserialize_account::<UserStats>(&data)
+        };
+        
+        if let Ok(mut user_stats) = user_stats_result {
             user_stats.total_trades += 1;
             user_stats.total_volume_e6 = checked_add_u64(
                 user_stats.total_volume_e6,
@@ -1087,6 +1098,7 @@ fn process_open_position(
                 user_stats.first_trade_at = current_ts;
             }
             user_stats.last_trade_at = current_ts;
+            // 现在可以安全地可变借用
             user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
         }
     }
@@ -1210,16 +1222,23 @@ fn process_close_position(
 
     // 更新用户统计
     if user_stats_info.data_len() > 0 {
-        let mut user_stats = deserialize_account::<UserStats>(&user_stats_info.data.borrow())?;
-        user_stats.total_trades += 1;
-        user_stats.total_volume_e6 = checked_add_u64(
-            user_stats.total_volume_e6,
-            (close_size as u128 * price_e6 as u128 / 1_000_000) as u64,
-        )?;
-        user_stats.total_realized_pnl_e6 = checked_add(user_stats.total_realized_pnl_e6, realized_pnl)?;
-        user_stats.total_fees_paid_e6 = checked_add_u64(user_stats.total_fees_paid_e6, fee)?;
-        user_stats.last_trade_at = current_ts;
-        user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
+        // 先读取数据到局部变量，释放借用
+        let user_stats_result = {
+            let data = user_stats_info.data.borrow();
+            deserialize_account::<UserStats>(&data)
+        };
+        
+        if let Ok(mut user_stats) = user_stats_result {
+            user_stats.total_trades += 1;
+            user_stats.total_volume_e6 = checked_add_u64(
+                user_stats.total_volume_e6,
+                (close_size as u128 * price_e6 as u128 / 1_000_000) as u64,
+            )?;
+            user_stats.total_realized_pnl_e6 = checked_add(user_stats.total_realized_pnl_e6, realized_pnl)?;
+            user_stats.total_fees_paid_e6 = checked_add_u64(user_stats.total_fees_paid_e6, fee)?;
+            user_stats.last_trade_at = current_ts;
+            user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
+        }
     }
 
     msg!(
@@ -1374,11 +1393,18 @@ fn process_liquidate(
 
     // 更新用户统计
     if user_stats_info.data_len() > 0 {
-        let mut user_stats = deserialize_account::<UserStats>(&user_stats_info.data.borrow())?;
-        user_stats.total_liquidations += 1;
-        user_stats.total_realized_pnl_e6 = checked_add(user_stats.total_realized_pnl_e6, pnl)?;
-        user_stats.last_trade_at = current_ts;
-        user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
+        // 先读取数据到局部变量，释放借用
+        let user_stats_result = {
+            let data = user_stats_info.data.borrow();
+            deserialize_account::<UserStats>(&data)
+        };
+        
+        if let Ok(mut user_stats) = user_stats_result {
+            user_stats.total_liquidations += 1;
+            user_stats.total_realized_pnl_e6 = checked_add(user_stats.total_realized_pnl_e6, pnl)?;
+            user_stats.last_trade_at = current_ts;
+            user_stats.serialize(&mut &mut user_stats_info.data.borrow_mut()[..])?;
+        }
     }
 
     msg!(
