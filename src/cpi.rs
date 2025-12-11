@@ -424,6 +424,43 @@ pub fn calculate_fee(size_e6: u64, price_e6: u64, fee_rate_e6: u64) -> Result<u6
     Ok(fee as u64)
 }
 
+// =============================================================================
+// User Account Reading (Non-CPI, direct account read)
+// =============================================================================
+
+/// Vault UserAccount 结构（简化版，只包含需要读取的字段）
+/// 必须与 Vault 程序中的 UserAccount 布局一致！
+#[derive(Debug)]
+pub struct VaultUserAccount {
+    pub locked_margin_e6: i64,
+}
+
+/// 从 AccountInfo 读取 Vault 的 UserAccount
+/// 
+/// UserAccount 布局:
+/// - discriminator: 8 bytes (offset 0-8)
+/// - wallet: 32 bytes (offset 8-40)
+/// - bump: 1 byte (offset 40-41)
+/// - available_balance_e6: 8 bytes (offset 41-49)
+/// - locked_margin_e6: 8 bytes (offset 49-57)
+pub fn read_user_account(user_account_info: &AccountInfo) -> Result<VaultUserAccount, crate::error::LedgerError> {
+    let data = user_account_info.data.borrow();
+    
+    // 验证数据长度
+    if data.len() < 57 {
+        return Err(crate::error::LedgerError::InvalidAccount);
+    }
+    
+    // 读取 locked_margin_e6 (offset 49-57)
+    let locked_margin_e6 = i64::from_le_bytes(
+        data[49..57].try_into().map_err(|_| crate::error::LedgerError::InvalidAccount)?
+    );
+    
+    Ok(VaultUserAccount {
+        locked_margin_e6,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

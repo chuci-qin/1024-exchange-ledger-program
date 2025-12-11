@@ -291,6 +291,25 @@ pub enum LedgerInstruction {
     /// 1. `[writable]` UserStats PDA
     /// 2. `[]` System Program
     InitializeUserStats,
+    
+    // ========================================================================
+    // Admin 工具指令
+    // ========================================================================
+    
+    /// Admin 重置 Position（仅测试网使用）
+    /// 
+    /// 用于清理累积的测试仓位
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[writable]` Position PDA
+    /// 2. `[]` LedgerConfig
+    AdminResetPosition {
+        /// 用户钱包
+        user: Pubkey,
+        /// 市场索引
+        market_index: u8,
+    },
 }
 
 /// 单笔交易数据 (用于批量执行)

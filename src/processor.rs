@@ -150,6 +150,14 @@ pub fn process_instruction(
             msg!("Instruction: UpdateFundProgram");
             process_update_fund_program(accounts, new_fund_program)
         }
+        LedgerInstruction::InitializeUserStats => {
+            msg!("Instruction: InitializeUserStats");
+            process_initialize_user_stats(program_id, accounts)
+        }
+        LedgerInstruction::AdminResetPosition { user, market_index } => {
+            msg!("Instruction: AdminResetPosition");
+            process_admin_reset_position(program_id, accounts, user, market_index)
+        }
     }
 }
 
@@ -1165,15 +1173,32 @@ fn process_close_position(
     let realized_pnl = mul_e6(pnl, close_ratio)?;
 
     // 计算释放的保证金
-    let margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
+    let mut margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
 
     // 计算手续费
     let fee = cpi::calculate_fee(close_size, price_e6, 1_000)?; // 0.1% fee
 
     let current_ts = get_current_timestamp()?;
 
+    // 🔧 完全平仓时，读取用户的 locked_margin 并释放全部
+    // 这解决了 position.margin_e6 与实际 locked_margin 不一致的问题
+    let is_full_close = close_size >= position.size_e6;
+    if is_full_close {
+        // 读取 user_account 获取实际 locked_margin
+        let user_account = cpi::read_user_account(user_account_info)?;
+        let actual_locked = user_account.locked_margin_e6 as u64;
+        
+        // 如果实际锁定金额大于计算的释放金额，释放全部
+        // 假设用户只有一个仓位，平仓后应该释放全部 locked_margin
+        if actual_locked > margin_to_release {
+            msg!("🔧 Full close: releasing all locked_margin={} instead of calculated={}", 
+                 actual_locked, margin_to_release);
+            margin_to_release = actual_locked;
+        }
+    }
+
     // 更新或关闭仓位
-    if close_size >= position.size_e6 {
+    if is_full_close {
         // 全部平仓 - 重置仓位
         position.size_e6 = 0;
         position.margin_e6 = 0;
@@ -1186,6 +1211,23 @@ fn process_close_position(
         position.margin_e6 = checked_sub_u64(position.margin_e6, margin_to_release)?;
         // 重新计算清算价格
         position.liquidation_price_e6 = position.calculate_liquidation_price()?;
+        
+        // 🔧 检查部分平仓后是否完全平掉了
+        // 如果是，释放全部 locked_margin
+        if position.size_e6 == 0 {
+            msg!("🔧 Position fully closed after partial close, releasing all locked_margin");
+            let user_account = cpi::read_user_account(user_account_info)?;
+            let actual_locked = user_account.locked_margin_e6 as u64;
+            if actual_locked > margin_to_release {
+                msg!("🔧 Releasing all locked_margin={} instead of calculated={}", actual_locked, margin_to_release);
+                margin_to_release = actual_locked;
+            }
+            // 重置仓位状态
+            position.margin_e6 = 0;
+            position.entry_price_e6 = 0;
+            position.liquidation_price_e6 = 0;
+            position.unrealized_pnl_e6 = 0;
+        }
     }
     position.last_update_ts = current_ts;
     position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
@@ -1996,6 +2038,64 @@ fn process_update_fund_program(accounts: &[AccountInfo], new_fund_program: Pubke
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
     msg!("Fund program updated to: {}", new_fund_program);
+    Ok(())
+}
+
+// ============================================================================
+// Admin 工具指令
+// ============================================================================
+
+/// 🔧 Admin 重置 Position（仅测试网使用）
+/// 
+/// 将 Position 的 size 和其他字段重置为 0，用于清理累积的测试仓位
+fn process_admin_reset_position(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    user: Pubkey,
+    market_index: u8,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let admin = next_account_info(account_info_iter)?;
+    let position_info = next_account_info(account_info_iter)?;
+    let ledger_config_info = next_account_info(account_info_iter)?;
+
+    assert_signer(admin)?;
+    assert_writable(position_info)?;
+
+    // 验证 Admin
+    let ledger_config = deserialize_account::<LedgerConfig>(&ledger_config_info.data.borrow())?;
+    if ledger_config.admin != *admin.key {
+        msg!("❌ Invalid admin: expected {}, got {}", ledger_config.admin, admin.key);
+        return Err(LedgerError::InvalidAdmin.into());
+    }
+
+    // 验证 Position PDA
+    let (position_pda, _) = Pubkey::find_program_address(
+        &[b"position", user.as_ref(), &[market_index]],
+        program_id,
+    );
+    if position_info.key != &position_pda {
+        msg!("❌ Invalid Position PDA");
+        return Err(LedgerError::InvalidAccount.into());
+    }
+
+    // 读取并重置 Position
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+    
+    msg!("🔧 Resetting Position: user={}, market={}, current_size={}", 
+         user, market_index, position.size_e6);
+    
+    // 重置所有字段
+    position.size_e6 = 0;
+    position.margin_e6 = 0;
+    position.entry_price_e6 = 0;
+    position.liquidation_price_e6 = 0;
+    position.unrealized_pnl_e6 = 0;
+    position.last_update_ts = get_current_timestamp()?;
+    
+    position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+
+    msg!("✅ Position reset to zero");
     Ok(())
 }
 
