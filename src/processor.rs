@@ -158,6 +158,29 @@ pub fn process_instruction(
             msg!("Instruction: AdminResetPosition");
             process_admin_reset_position(program_id, accounts, user, market_index)
         }
+        
+        // Spot 交易指令
+        LedgerInstruction::RecordSpotTrade {
+            user,
+            market_index,
+            is_buy,
+            base_amount_e6,
+            quote_amount_e6,
+            price_e6,
+            fee_e6,
+            is_taker,
+            batch_id,
+        } => {
+            msg!("Instruction: RecordSpotTrade");
+            process_record_spot_trade(
+                program_id, accounts, user, market_index, is_buy,
+                base_amount_e6, quote_amount_e6, price_e6, fee_e6, is_taker, batch_id
+            )
+        }
+        LedgerInstruction::BatchRecordSpotTrades { trades, batch_id } => {
+            msg!("Instruction: BatchRecordSpotTrades");
+            process_batch_record_spot_trades(program_id, accounts, trades, batch_id)
+        }
     }
 }
 
@@ -2096,6 +2119,201 @@ fn process_admin_reset_position(
     position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
 
     msg!("✅ Position reset to zero");
+    Ok(())
+}
+
+// ============================================================================
+// Spot 交易指令处理
+// ============================================================================
+
+use crate::state::{SpotTradeRecord, SpotSide, spot_fee_type};
+use crate::instruction::SpotTradeData;
+
+/// 记录单笔 Spot 成交
+fn process_record_spot_trade(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    user: Pubkey,
+    market_index: u16,
+    is_buy: bool,
+    base_amount_e6: u64,
+    quote_amount_e6: u64,
+    price_e6: u64,
+    fee_e6: u64,
+    is_taker: bool,
+    batch_id: u64,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let relayer = next_account_info(account_info_iter)?;
+    let spot_trade_info = next_account_info(account_info_iter)?;
+    let ledger_config_info = next_account_info(account_info_iter)?;
+    let relayer_config_info = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+
+    assert_signer(relayer)?;
+    assert_writable(spot_trade_info)?;
+    assert_writable(ledger_config_info)?;
+
+    // 验证 Relayer 授权
+    let relayer_config = deserialize_account::<RelayerConfig>(&relayer_config_info.data.borrow())?;
+    if !relayer_config.is_authorized(relayer.key) {
+        msg!("❌ Unauthorized relayer: {}", relayer.key);
+        return Err(LedgerError::UnauthorizedRelayer.into());
+    }
+
+    // 获取下一个序列号
+    let mut ledger_config = deserialize_account::<LedgerConfig>(&ledger_config_info.data.borrow())?;
+    let sequence = ledger_config.next_sequence();
+
+    // 派生 SpotTradeRecord PDA
+    let (spot_trade_pda, spot_trade_bump) = Pubkey::find_program_address(
+        &[SpotTradeRecord::SEED_PREFIX, &sequence.to_le_bytes()],
+        program_id,
+    );
+
+    if spot_trade_info.key != &spot_trade_pda {
+        msg!("❌ Invalid SpotTradeRecord PDA");
+        return Err(LedgerError::InvalidAccount.into());
+    }
+
+    // 创建账户
+    let rent = Rent::get()?;
+    let space = SpotTradeRecord::SIZE;
+    let lamports = rent.minimum_balance(space);
+
+    invoke_signed(
+        &system_instruction::create_account(
+            relayer.key,
+            spot_trade_info.key,
+            lamports,
+            space as u64,
+            program_id,
+        ),
+        &[relayer.clone(), spot_trade_info.clone(), system_program.clone()],
+        &[&[SpotTradeRecord::SEED_PREFIX, &sequence.to_le_bytes(), &[spot_trade_bump]]],
+    )?;
+
+    // 初始化 SpotTradeRecord
+    let current_ts = get_current_timestamp()?;
+    let spot_trade = SpotTradeRecord {
+        discriminator: SpotTradeRecord::DISCRIMINATOR,
+        sequence,
+        user,
+        market_index,
+        side: if is_buy { SpotSide::Buy } else { SpotSide::Sell },
+        base_amount_e6,
+        quote_amount_e6,
+        price_e6,
+        fee_e6,
+        fee_type: if is_taker { spot_fee_type::TAKER } else { spot_fee_type::MAKER },
+        timestamp: current_ts,
+        batch_id,
+        bump: spot_trade_bump,
+        reserved: [0u8; 32],
+    };
+
+    spot_trade.serialize(&mut &mut spot_trade_info.data.borrow_mut()[..])?;
+
+    // 更新 LedgerConfig 统计
+    ledger_config.total_volume_e6 = ledger_config.total_volume_e6.saturating_add(quote_amount_e6);
+    ledger_config.total_fees_collected_e6 = ledger_config.total_fees_collected_e6.saturating_add(fee_e6);
+    ledger_config.last_update_ts = current_ts;
+    ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
+
+    msg!("✅ SpotTradeRecord created: seq={}, user={}, market={}, side={}, base={}, quote={}, fee={}",
+         sequence, user, market_index, if is_buy { "Buy" } else { "Sell" },
+         base_amount_e6, quote_amount_e6, fee_e6);
+
+    Ok(())
+}
+
+/// 批量记录 Spot 成交
+fn process_batch_record_spot_trades(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    trades: Vec<SpotTradeData>,
+    batch_id: u64,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let relayer = next_account_info(account_info_iter)?;
+    let ledger_config_info = next_account_info(account_info_iter)?;
+    let relayer_config_info = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+
+    assert_signer(relayer)?;
+    assert_writable(ledger_config_info)?;
+
+    // 验证 Relayer 授权
+    let relayer_config = deserialize_account::<RelayerConfig>(&relayer_config_info.data.borrow())?;
+    if !relayer_config.is_authorized(relayer.key) {
+        return Err(LedgerError::UnauthorizedRelayer.into());
+    }
+
+    let mut ledger_config = deserialize_account::<LedgerConfig>(&ledger_config_info.data.borrow())?;
+    let current_ts = get_current_timestamp()?;
+    let rent = Rent::get()?;
+    let space = SpotTradeRecord::SIZE;
+    let lamports = rent.minimum_balance(space);
+
+    for trade in trades.iter() {
+        let spot_trade_info = next_account_info(account_info_iter)?;
+        assert_writable(spot_trade_info)?;
+
+        let sequence = ledger_config.next_sequence();
+
+        // 派生 PDA
+        let (spot_trade_pda, spot_trade_bump) = Pubkey::find_program_address(
+            &[SpotTradeRecord::SEED_PREFIX, &sequence.to_le_bytes()],
+            program_id,
+        );
+
+        if spot_trade_info.key != &spot_trade_pda {
+            msg!("❌ Invalid SpotTradeRecord PDA for sequence {}", sequence);
+            return Err(LedgerError::InvalidAccount.into());
+        }
+
+        // 创建账户
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer.key,
+                spot_trade_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer.clone(), spot_trade_info.clone(), system_program.clone()],
+            &[&[SpotTradeRecord::SEED_PREFIX, &sequence.to_le_bytes(), &[spot_trade_bump]]],
+        )?;
+
+        // 初始化
+        let spot_trade = SpotTradeRecord {
+            discriminator: SpotTradeRecord::DISCRIMINATOR,
+            sequence,
+            user: trade.user,
+            market_index: trade.market_index,
+            side: if trade.is_buy { SpotSide::Buy } else { SpotSide::Sell },
+            base_amount_e6: trade.base_amount_e6,
+            quote_amount_e6: trade.quote_amount_e6,
+            price_e6: trade.price_e6,
+            fee_e6: trade.fee_e6,
+            fee_type: if trade.is_taker { spot_fee_type::TAKER } else { spot_fee_type::MAKER },
+            timestamp: current_ts,
+            batch_id,
+            bump: spot_trade_bump,
+            reserved: [0u8; 32],
+        };
+
+        spot_trade.serialize(&mut &mut spot_trade_info.data.borrow_mut()[..])?;
+
+        // 累加统计
+        ledger_config.total_volume_e6 = ledger_config.total_volume_e6.saturating_add(trade.quote_amount_e6);
+        ledger_config.total_fees_collected_e6 = ledger_config.total_fees_collected_e6.saturating_add(trade.fee_e6);
+    }
+
+    ledger_config.last_update_ts = current_ts;
+    ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
+
+    msg!("✅ BatchRecordSpotTrades: {} trades recorded, batch_id={}", trades.len(), batch_id);
     Ok(())
 }
 

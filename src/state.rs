@@ -736,6 +736,80 @@ impl PredictionMarketEvent {
     pub const SEED_PREFIX: &'static [u8] = b"prediction_market_event";
 }
 
+// ============================================================================
+// Spot 交易相关结构 (Phase 2/3)
+// ============================================================================
+
+/// Spot 交易方向
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpotSide {
+    /// 买入 (使用 quote 购买 base)
+    Buy,
+    /// 卖出 (出售 base 获得 quote)
+    Sell,
+}
+
+/// Spot 成交记录 (PDA)
+/// Seeds: ["spot_trade", sequence.to_le_bytes()]
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct SpotTradeRecord {
+    /// 账户鉴别器
+    pub discriminator: [u8; 8],
+    /// 全局序列号
+    pub sequence: u64,
+    /// 用户钱包
+    pub user: Pubkey,
+    /// 市场索引 (u16 for consistency with Listing Program)
+    pub market_index: u16,
+    /// 交易方向
+    pub side: SpotSide,
+    /// Base 数量 (e6)
+    pub base_amount_e6: u64,
+    /// Quote 数量 (e6)
+    pub quote_amount_e6: u64,
+    /// 成交价格 (e6)
+    pub price_e6: u64,
+    /// 手续费 (e6, 以 quote token 计)
+    pub fee_e6: u64,
+    /// 手续费类型 (0=Taker, 1=Maker)
+    pub fee_type: u8,
+    /// 成交时间
+    pub timestamp: i64,
+    /// 批次 ID
+    pub batch_id: u64,
+    /// Bump
+    pub bump: u8,
+    /// 预留空间
+    pub reserved: [u8; 32],
+}
+
+impl SpotTradeRecord {
+    pub const DISCRIMINATOR: [u8; 8] = *b"spot_trd";
+    pub const SIZE: usize = 8 + // discriminator
+        8 + // sequence
+        32 + // user
+        2 + // market_index (u16)
+        1 + // side
+        8 + // base_amount_e6
+        8 + // quote_amount_e6
+        8 + // price_e6
+        8 + // fee_e6
+        1 + // fee_type
+        8 + // timestamp
+        8 + // batch_id
+        1 + // bump
+        32; // reserved
+
+    /// PDA Seeds prefix
+    pub const SEED_PREFIX: &'static [u8] = b"spot_trade";
+}
+
+/// Spot 手续费类型
+pub mod spot_fee_type {
+    pub const TAKER: u8 = 0;
+    pub const MAKER: u8 = 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

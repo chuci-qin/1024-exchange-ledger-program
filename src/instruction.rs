@@ -310,6 +310,77 @@ pub enum LedgerInstruction {
         /// 市场索引
         market_index: u8,
     },
+
+    // ========================================================================
+    // Spot 交易指令
+    // ========================================================================
+
+    /// 记录 Spot 成交
+    /// 
+    /// 由 Relayer 调用，记录 Spot 成交信息到链上
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[writable]` SpotTradeRecord PDA
+    /// 2. `[writable]` LedgerConfig
+    /// 3. `[]` RelayerConfig
+    /// 4. `[]` System Program
+    RecordSpotTrade {
+        /// 用户钱包
+        user: Pubkey,
+        /// 市场索引
+        market_index: u16,
+        /// 交易方向
+        is_buy: bool,
+        /// Base 数量 (e6)
+        base_amount_e6: u64,
+        /// Quote 数量 (e6)
+        quote_amount_e6: u64,
+        /// 成交价格 (e6)
+        price_e6: u64,
+        /// 手续费 (e6)
+        fee_e6: u64,
+        /// 是否为 Taker
+        is_taker: bool,
+        /// 批次 ID
+        batch_id: u64,
+    },
+
+    /// 批量记录 Spot 成交
+    /// 
+    /// 用于提高效率，一次记录多笔成交
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[writable]` LedgerConfig
+    /// 2. `[]` RelayerConfig
+    /// 3. `[]` System Program
+    /// 4+ `[writable]` SpotTradeRecord PDAs
+    BatchRecordSpotTrades {
+        trades: Vec<SpotTradeData>,
+        batch_id: u64,
+    },
+}
+
+/// Spot 交易数据 (用于批量记录)
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct SpotTradeData {
+    /// 用户钱包
+    pub user: Pubkey,
+    /// 市场索引
+    pub market_index: u16,
+    /// 是否为 Buy
+    pub is_buy: bool,
+    /// Base 数量 (e6)
+    pub base_amount_e6: u64,
+    /// Quote 数量 (e6)
+    pub quote_amount_e6: u64,
+    /// 成交价格 (e6)
+    pub price_e6: u64,
+    /// 手续费 (e6)
+    pub fee_e6: u64,
+    /// 是否为 Taker
+    pub is_taker: bool,
 }
 
 /// 单笔交易数据 (用于批量执行)
