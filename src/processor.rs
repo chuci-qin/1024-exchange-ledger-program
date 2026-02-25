@@ -727,7 +727,7 @@ fn process_execute_trade_batch(
 
                 // 计算所需保证金和手续费
                 let required_margin = cpi::calculate_required_margin(trade.size_e6, trade.price_e6, trade.leverage)?;
-                let fee = cpi::calculate_fee(trade.size_e6, trade.price_e6, 1_000)?; // 0.1% fee
+                let fee = cpi::calculate_fee(trade.size_e6, trade.price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
 
                 // 检查是否是新仓位
                 let is_new_position = position_info.data_len() == 0 || {
@@ -837,7 +837,7 @@ fn process_execute_trade_batch(
                 let pnl = position.calculate_unrealized_pnl(trade.price_e6)?;
                 let realized_pnl = mul_e6(pnl, close_ratio)?;
                 let margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
-                let fee = cpi::calculate_fee(close_size, trade.price_e6, 1_000)?;
+                let fee = cpi::calculate_fee(close_size, trade.price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
 
                 // 更新仓位
                 if close_size >= position.size_e6 {
@@ -983,7 +983,7 @@ fn process_open_position(
 
     // 计算所需保证金
     let required_margin = cpi::calculate_required_margin(size_e6, price_e6, leverage)?;
-    let fee = cpi::calculate_fee(size_e6, price_e6, 1_000)?; // 0.1% fee
+    let fee = cpi::calculate_fee(size_e6, price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
 
     // 派生 Position PDA
     let (position_pda, position_bump) = Pubkey::find_program_address(
@@ -1199,7 +1199,7 @@ fn process_close_position(
     let mut margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
 
     // 计算手续费
-    let fee = cpi::calculate_fee(close_size, price_e6, 1_000)?; // 0.1% fee
+    let fee = cpi::calculate_fee(close_size, price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
 
     let current_ts = get_current_timestamp()?;
 
