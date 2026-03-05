@@ -143,6 +143,10 @@ pub enum LedgerError {
     // === Batch 相关 ===
     #[error("Insufficient accounts for trade batch")]
     InsufficientAccounts,
+
+    // === Fee 相关 ===
+    #[error("Fee rate exceeds maximum allowed (10000 = 1%)")]
+    InvalidFeeRate,
 }
 
 impl From<LedgerError> for ProgramError {

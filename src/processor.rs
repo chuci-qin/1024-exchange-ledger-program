@@ -75,10 +75,15 @@ pub fn process_instruction(
             price_e6,
             leverage,
             batch_id,
+            is_taker: _,
+            fee_rate_e6,
         } => {
             msg!("Instruction: OpenPosition");
+            if fee_rate_e6 > 10_000 {
+                return Err(LedgerError::InvalidFeeRate.into());
+            }
             process_open_position(
-                program_id, accounts, user, market_index, side, size_e6, price_e6, leverage, batch_id,
+                program_id, accounts, user, market_index, side, size_e6, price_e6, leverage, batch_id, fee_rate_e6,
             )
         }
         LedgerInstruction::ClosePosition {
@@ -87,9 +92,14 @@ pub fn process_instruction(
             size_e6,
             price_e6,
             batch_id,
+            is_taker: _,
+            fee_rate_e6,
         } => {
             msg!("Instruction: ClosePosition");
-            process_close_position(program_id, accounts, user, market_index, size_e6, price_e6, batch_id)
+            if fee_rate_e6 > 10_000 {
+                return Err(LedgerError::InvalidFeeRate.into());
+            }
+            process_close_position(program_id, accounts, user, market_index, size_e6, price_e6, batch_id, fee_rate_e6)
         }
 
         // 清算
@@ -727,7 +737,10 @@ fn process_execute_trade_batch(
 
                 // 计算所需保证金和手续费
                 let required_margin = cpi::calculate_required_margin(trade.size_e6, trade.price_e6, trade.leverage)?;
-                let fee = cpi::calculate_fee(trade.size_e6, trade.price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
+                if trade.fee_rate_e6 > 10_000 {
+                    return Err(LedgerError::InvalidFeeRate.into());
+                }
+                let fee = cpi::calculate_fee(trade.size_e6, trade.price_e6, trade.fee_rate_e6)?;
 
                 // 检查是否是新仓位
                 let is_new_position = position_info.data_len() == 0 || {
@@ -837,7 +850,10 @@ fn process_execute_trade_batch(
                 let pnl = position.calculate_unrealized_pnl(trade.price_e6)?;
                 let realized_pnl = mul_e6(pnl, close_ratio)?;
                 let margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
-                let fee = cpi::calculate_fee(close_size, trade.price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
+                if trade.fee_rate_e6 > 10_000 {
+                    return Err(LedgerError::InvalidFeeRate.into());
+                }
+                let fee = cpi::calculate_fee(close_size, trade.price_e6, trade.fee_rate_e6)?;
 
                 // 更新仓位
                 if close_size >= position.size_e6 {
@@ -936,6 +952,7 @@ fn process_open_position(
     price_e6: u64,
     leverage: u8,
     batch_id: u64,
+    fee_rate: u64,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
     let relayer = next_account_info(account_info_iter)?;
@@ -983,7 +1000,7 @@ fn process_open_position(
 
     // 计算所需保证金
     let required_margin = cpi::calculate_required_margin(size_e6, price_e6, leverage)?;
-    let fee = cpi::calculate_fee(size_e6, price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
+    let fee = cpi::calculate_fee(size_e6, price_e6, fee_rate)?; // P1B: dynamic fee rate
 
     // 派生 Position PDA
     let (position_pda, position_bump) = Pubkey::find_program_address(
@@ -1146,6 +1163,7 @@ fn process_close_position(
     size_e6: u64,
     price_e6: u64,
     batch_id: u64,
+    fee_rate: u64,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
     let relayer = next_account_info(account_info_iter)?;
@@ -1199,7 +1217,7 @@ fn process_close_position(
     let mut margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
 
     // 计算手续费
-    let fee = cpi::calculate_fee(close_size, price_e6, 500)?; // 0.05% taker fee (was 1_000 = 0.1%)
+    let fee = cpi::calculate_fee(close_size, price_e6, fee_rate)?; // P1B: dynamic fee rate
 
     let current_ts = get_current_timestamp()?;
 

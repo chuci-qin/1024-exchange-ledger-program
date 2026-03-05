@@ -118,6 +118,10 @@ pub enum LedgerInstruction {
         price_e6: u64,
         leverage: u8,
         batch_id: u64,
+        /// 0 = taker, 1 = maker (for logging/stats)
+        is_taker: u8,
+        /// Fee rate in e6 units (e.g., 500 = 5 bps = 0.05%). Passed by Relayer.
+        fee_rate_e6: u64,
     },
 
     /// 平仓 (原子操作)
@@ -144,6 +148,10 @@ pub enum LedgerInstruction {
         size_e6: u64,
         price_e6: u64,
         batch_id: u64,
+        /// 0 = taker, 1 = maker (for logging/stats)
+        is_taker: u8,
+        /// Fee rate in e6 units (e.g., 500 = 5 bps = 0.05%). Passed by Relayer.
+        fee_rate_e6: u64,
     },
 
     // ========================================================================
@@ -400,6 +408,10 @@ pub struct TradeData {
     pub price_e6: u64,
     /// 杠杆 (仅开仓)
     pub leverage: u8,
+    /// 0 = taker, 1 = maker (for logging/stats)
+    pub is_taker: u8,
+    /// Fee rate in e6 units (e.g., 500 = 5 bps). Passed by Relayer.
+    pub fee_rate_e6: u64,
 }
 
 /// 交易数据类型常量
