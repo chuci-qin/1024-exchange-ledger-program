@@ -15,6 +15,7 @@ use solana_program::{
 
 use crate::{
     error::LedgerError,
+    events,
     instruction::{LedgerInstruction, TradeData, trade_data_type},
     state::*,
     utils::*,
@@ -844,19 +845,19 @@ fn process_execute_trade_batch(
                     return Err(LedgerError::PositionNotFound.into());
                 }
 
-                // 计算平仓数量和盈亏
                 let close_size = trade.size_e6.min(position.size_e6);
                 let close_ratio = div_e6(close_size as i64, position.size_e6 as i64)?;
                 let pnl = position.calculate_unrealized_pnl(trade.price_e6)?;
                 let realized_pnl = mul_e6(pnl, close_ratio)?;
-                let margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
+                let original_margin = position.margin_e6;
+                let mut margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
                 if trade.fee_rate_e6 > 10_000 {
                     return Err(LedgerError::InvalidFeeRate.into());
                 }
                 let fee = cpi::calculate_fee(close_size, trade.price_e6, trade.fee_rate_e6)?;
 
-                // 更新仓位
                 if close_size >= position.size_e6 {
+                    margin_to_release = position.margin_e6;
                     position.size_e6 = 0;
                     position.margin_e6 = 0;
                     position.entry_price_e6 = 0;
@@ -866,6 +867,13 @@ fn process_execute_trade_batch(
                     position.size_e6 = checked_sub_u64(position.size_e6, close_size)?;
                     position.margin_e6 = checked_sub_u64(position.margin_e6, margin_to_release)?;
                     position.liquidation_price_e6 = position.calculate_liquidation_price()?;
+                    if position.size_e6 == 0 {
+                        margin_to_release = original_margin;
+                        position.margin_e6 = 0;
+                        position.entry_price_e6 = 0;
+                        position.liquidation_price_e6 = 0;
+                        position.unrealized_pnl_e6 = 0;
+                    }
                 }
                 position.last_update_ts = current_ts;
                 position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
@@ -1044,7 +1052,7 @@ fn process_open_position(
             side,
             size_e6,
             entry_price_e6: price_e6,
-            margin_e6: required_margin,
+            margin_e6: checked_add_u64(required_margin, fee)?,
             leverage,
             liquidation_price_e6: 0, // 计算后设置
             unrealized_pnl_e6: 0,
@@ -1076,7 +1084,7 @@ fn process_open_position(
 
         // 更新仓位
         position.update_entry_price(size_e6, price_e6)?;
-        position.margin_e6 = checked_add_u64(position.margin_e6, required_margin)?;
+        position.margin_e6 = checked_add_u64(position.margin_e6, checked_add_u64(required_margin, fee)?)?;
         position.last_update_ts = current_ts;
 
         position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
@@ -1213,57 +1221,36 @@ fn process_close_position(
     let pnl = position.calculate_unrealized_pnl(price_e6)?;
     let realized_pnl = mul_e6(pnl, close_ratio)?;
 
-    // 计算释放的保证金
+    // S0-4 fix: capture original margin before any mutation, so partial-to-full-close
+    // releases the correct total amount instead of only the rounding remainder.
+    let original_margin = position.margin_e6;
+
     let mut margin_to_release = mul_e6(position.margin_e6 as i64, close_ratio)? as u64;
 
-    // 计算手续费
-    let fee = cpi::calculate_fee(close_size, price_e6, fee_rate)?; // P1B: dynamic fee rate
+    let fee = cpi::calculate_fee(close_size, price_e6, fee_rate)?;
 
     let current_ts = get_current_timestamp()?;
 
-    // 🔧 完全平仓时，读取用户的 locked_margin 并释放全部
-    // 这解决了 position.margin_e6 与实际 locked_margin 不一致的问题
     let is_full_close = close_size >= position.size_e6;
     if is_full_close {
-        // 读取 user_account 获取实际 locked_margin
-        let user_account = cpi::read_user_account(user_account_info)?;
-        let actual_locked = user_account.locked_margin_e6 as u64;
-        
-        // 如果实际锁定金额大于计算的释放金额，释放全部
-        // 假设用户只有一个仓位，平仓后应该释放全部 locked_margin
-        if actual_locked > margin_to_release {
-            msg!("🔧 Full close: releasing all locked_margin={} instead of calculated={}", 
-                 actual_locked, margin_to_release);
-            margin_to_release = actual_locked;
-        }
+        margin_to_release = position.margin_e6;
     }
 
-    // 更新或关闭仓位
     if is_full_close {
-        // 全部平仓 - 重置仓位
         position.size_e6 = 0;
         position.margin_e6 = 0;
         position.entry_price_e6 = 0;
         position.liquidation_price_e6 = 0;
         position.unrealized_pnl_e6 = 0;
     } else {
-        // 部分平仓
         position.size_e6 = checked_sub_u64(position.size_e6, close_size)?;
         position.margin_e6 = checked_sub_u64(position.margin_e6, margin_to_release)?;
-        // 重新计算清算价格
         position.liquidation_price_e6 = position.calculate_liquidation_price()?;
         
-        // 🔧 检查部分平仓后是否完全平掉了
-        // 如果是，释放全部 locked_margin
         if position.size_e6 == 0 {
-            msg!("🔧 Position fully closed after partial close, releasing all locked_margin");
-            let user_account = cpi::read_user_account(user_account_info)?;
-            let actual_locked = user_account.locked_margin_e6 as u64;
-            if actual_locked > margin_to_release {
-                msg!("🔧 Releasing all locked_margin={} instead of calculated={}", actual_locked, margin_to_release);
-                margin_to_release = actual_locked;
-            }
-            // 重置仓位状态
+            // S0-4: partial close resulted in full close due to precision —
+            // release the ENTIRE original margin, not just the remainder after proportional subtraction.
+            margin_to_release = original_margin;
             position.margin_e6 = 0;
             position.entry_price_e6 = 0;
             position.liquidation_price_e6 = 0;
@@ -1691,7 +1678,6 @@ fn process_trigger_adl(
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
     // P0-2 步骤7: 发出 ADL 触发事件
-    // 使用 Solana 的 msg! 记录事件（链上程序无法发出真正的事件，使用日志）
     msg!("🚨 ADL_TRIGGERED_EVENT:");
     msg!("  market_index: {}", market_index);
     msg!("  shortfall_e6: {}", shortfall_e6);
@@ -1703,8 +1689,26 @@ fn process_trigger_adl(
     msg!("  timestamp: {}", current_ts);
     msg!("  adl_count: {}", ledger_config.total_adl_count);
 
-    // 注意: 实际的平仓操作由链下 ADL Engine 执行
-    // 链上仅负责验证和记录，并通过 CPI 暂停 LP 赎回
+    // Emit structured ADL event via events.rs (IR-44)
+    let adl_event = events::ADLEvent {
+        discriminator: events::event_discriminator::ADL,
+        sequence: ledger_config.total_adl_count,
+        timestamp: current_ts,
+        market_index,
+        trigger_reason: 0,
+        shortfall_e6: shortfall_e6 as u64,
+        insurance_balance_before_e6: insurance_balance_e6,
+        insurance_balance_after_e6: insurance_balance_e6 - (shortfall_e6 - adl_required),
+        bankrupt_user: *bankrupt_user_info.key,
+        bankrupt_side: match bankrupt_side { Side::Long => 0, Side::Short => 1 },
+        bankrupt_size_e6: 0,
+        counterparty_user: if validated_targets.is_empty() { Pubkey::default() } else { validated_targets[0] },
+        counterparty_side: match bankrupt_side { Side::Long => 1, Side::Short => 0 },
+        counterparty_size_reduced_e6: 0,
+        counterparty_pnl_e6: 0,
+        related_trade_sequence: 0,
+    };
+    events::emit_adl_event(&adl_event);
 
     Ok(())
 }
