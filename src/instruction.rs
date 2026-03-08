@@ -368,6 +368,45 @@ pub enum LedgerInstruction {
         trades: Vec<SpotTradeData>,
         batch_id: u64,
     },
+
+    // ========================================================================
+    // 订单事件存证指令
+    // ========================================================================
+
+    /// 批量记录订单事件（下单/取消/过期等）
+    ///
+    /// 由 Relayer 异步调用，将链下订单操作记录到链上日志。
+    /// 仅 emit 事件日志，不修改任何 PDA 状态。
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` LedgerConfig
+    /// 2. `[]` RelayerConfig
+    RecordOrderEvents {
+        events: Vec<OrderEventInput>,
+    },
+}
+
+/// 订单事件输入数据（由 Relayer 提交）
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct OrderEventInput {
+    pub order_id: [u8; 16],
+    pub client_order_id: [u8; 16],
+    pub user: Pubkey,
+    pub market_index: u8,
+    /// 0=Perp, 1=Spot
+    pub market_type: u8,
+    /// 0=Buy/Long, 1=Sell/Short
+    pub side: u8,
+    /// 0=Limit, 1=Market, 2=StopLimit, 3=StopMarket
+    pub order_type: u8,
+    pub price_e6: u64,
+    pub size_e6: u64,
+    /// OrderStatus: 0=Placed, 4=Cancelled, 5=Expired, 6=Rejected
+    pub status: u8,
+    /// StatusReason: 0=None, 8=UserCancelled, etc.
+    pub status_reason: u8,
+    pub timestamp: i64,
 }
 
 /// Spot 交易数据 (用于批量记录)
