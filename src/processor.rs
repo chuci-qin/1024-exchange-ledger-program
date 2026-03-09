@@ -15,8 +15,8 @@ use solana_program::{
 
 use crate::{
     error::LedgerError,
-    events::{self, OrderEvent, emit_order_event, event_discriminator},
-    instruction::{LedgerInstruction, TradeData, OrderEventInput, trade_data_type},
+    events::{self, OrderEvent, emit_order_event, event_discriminator, PositionEvent, TradeEvent, BatchEvent, FeeEvent, InsuranceFundEvent, emit_position_event, emit_trade_event, emit_batch_event, emit_fee_event, emit_insurance_fund_event},
+    instruction::{LedgerInstruction, TradeData, OrderEventInput, FundingEventInput, trade_data_type},
     state::*,
     utils::*,
     cpi,
@@ -195,6 +195,10 @@ pub fn process_instruction(
         LedgerInstruction::RecordOrderEvents { events } => {
             msg!("Instruction: RecordOrderEvents ({} events)", events.len());
             process_record_order_events(program_id, accounts, events)
+        }
+        LedgerInstruction::RecordFundingEvents { events } => {
+            msg!("Instruction: RecordFundingEvents ({} events)", events.len());
+            process_record_funding_events(program_id, accounts, events)
         }
     }
 }
@@ -598,6 +602,19 @@ fn process_confirm_trade_batch(
     // 添加签名
     trade_batch.add_signature(*relayer.key, current_ts)?;
     trade_batch.serialize(&mut &mut trade_batch_info.data.borrow_mut()[..])?;
+
+    emit_batch_event(&BatchEvent {
+        discriminator: event_discriminator::BATCH,
+        batch_id,
+        timestamp: current_ts,
+        event_type: 1,
+        trade_count: 0,
+        total_notional_e6: 0,
+        relayer: *relayer.key,
+        data_hash,
+        chain_tx: [0u8; 64],
+        error_code: 0,
+    });
 
     msg!(
         "TradeBatch {} confirmed by {}, signatures: {}",
@@ -1041,6 +1058,19 @@ fn process_execute_trade_batch(
     ledger_config.last_update_ts = current_ts;
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
+    emit_batch_event(&BatchEvent {
+        discriminator: event_discriminator::BATCH,
+        batch_id,
+        timestamp: current_ts,
+        event_type: 2,
+        trade_count: trades.len() as u16,
+        total_notional_e6: 0,
+        relayer: *relayer.key,
+        data_hash: trade_batch.data_hash,
+        chain_tx: [0u8; 64],
+        error_code: 0,
+    });
+
     msg!("✅ TradeBatch {} executed successfully with {} trades", batch_id, trades.len());
     Ok(())
 }
@@ -1126,6 +1156,15 @@ fn process_open_position(
         data.iter().all(|&x| x == 0)
     };
 
+    let mut pre_side: u8 = 0;
+    let mut pre_size: u64 = 0;
+    let mut pre_entry: u64 = 0;
+    let mut pre_margin: u64 = 0;
+    let mut post_side: u8 = 0;
+    let mut post_size: u64 = 0;
+    let mut post_entry: u64 = 0;
+    let mut post_margin: u64 = 0;
+
     if is_new_position {
         // 创建新仓位
         let rent = Rent::get()?;
@@ -1168,6 +1207,11 @@ fn process_open_position(
         position.liquidation_price_e6 = position.calculate_liquidation_price()?;
         position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
 
+        post_side = position.side as u8;
+        post_size = position.size_e6;
+        post_entry = position.entry_price_e6;
+        post_margin = position.margin_e6;
+
         msg!(
             "New position opened: user={}, market={}, side={:?}, size={}, entry={}, margin={}",
             user, market_index, side, size_e6, price_e6, required_margin
@@ -1181,12 +1225,22 @@ fn process_open_position(
             return Err(LedgerError::InvalidPositionSide.into());
         }
 
+        pre_side = position.side as u8;
+        pre_size = position.size_e6;
+        pre_entry = position.entry_price_e6;
+        pre_margin = position.margin_e6;
+
         // 更新仓位
         position.update_entry_price(size_e6, price_e6)?;
         position.margin_e6 = checked_add_u64(position.margin_e6, checked_add_u64(required_margin, fee)?)?;
         position.last_update_ts = current_ts;
 
         position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+
+        post_side = position.side as u8;
+        post_size = position.size_e6;
+        post_entry = position.entry_price_e6;
+        post_margin = position.margin_e6;
 
         msg!(
             "Position increased: user={}, market={}, new_size={}, new_margin={}",
@@ -1222,6 +1276,7 @@ fn process_open_position(
         (size_e6 as u128 * price_e6 as u128 / 1_000_000) as u64,
     )?;
     ledger_config.total_fees_collected_e6 = checked_add_u64(ledger_config.total_fees_collected_e6, fee)?;
+    let position_event_seq = ledger_config.next_sequence();
     ledger_config.last_update_ts = current_ts;
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
@@ -1259,6 +1314,28 @@ fn process_open_position(
     }
 
     msg!("OpenPosition completed: batch_id={}, margin_locked={}, fee={}", batch_id, total_to_lock, fee);
+
+    emit_position_event(&PositionEvent {
+        discriminator: event_discriminator::POSITION,
+        sequence: position_event_seq,
+        timestamp: current_ts,
+        user,
+        market_index,
+        event_type: if is_new_position { 0 } else { 1 },
+        side_before: pre_side,
+        size_before_e6: pre_size,
+        entry_price_before_e6: pre_entry,
+        margin_before_e6: pre_margin,
+        side_after: post_side,
+        size_after_e6: post_size,
+        entry_price_after_e6: post_entry,
+        margin_after_e6: post_margin,
+        size_delta_e6: size_e6 as i64,
+        realized_pnl_e6: 0,
+        fee_e6: fee,
+        related_trade_sequence: 0,
+    });
+
     Ok(())
 }
 
@@ -1311,6 +1388,11 @@ fn process_close_position(
     if position.is_empty() {
         return Err(LedgerError::PositionNotFound.into());
     }
+
+    let close_pre_side = position.side as u8;
+    let close_pre_size = position.size_e6;
+    let close_pre_entry = position.entry_price_e6;
+    let close_pre_margin = position.margin_e6;
 
     // 验证平仓数量
     let close_size = size_e6.min(position.size_e6);
@@ -1386,6 +1468,8 @@ fn process_close_position(
         (close_size as u128 * price_e6 as u128 / 1_000_000) as u64,
     )?;
     ledger_config.total_fees_collected_e6 = checked_add_u64(ledger_config.total_fees_collected_e6, fee)?;
+    let close_pos_event_seq = ledger_config.next_sequence();
+    let close_trade_event_seq = ledger_config.next_sequence();
     ledger_config.last_update_ts = current_ts;
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
@@ -1414,6 +1498,54 @@ fn process_close_position(
         "ClosePosition completed: batch_id={}, size={}, pnl={}, margin_released={}, fee={}",
         batch_id, close_size, realized_pnl, margin_to_release, fee
     );
+
+    let close_event_type = if position.size_e6 == 0 { 2u8 } else { 3u8 };
+    emit_position_event(&PositionEvent {
+        discriminator: event_discriminator::POSITION,
+        sequence: close_pos_event_seq,
+        timestamp: current_ts,
+        user,
+        market_index,
+        event_type: close_event_type,
+        side_before: close_pre_side,
+        size_before_e6: close_pre_size,
+        entry_price_before_e6: close_pre_entry,
+        margin_before_e6: close_pre_margin,
+        side_after: position.side as u8,
+        size_after_e6: position.size_e6,
+        entry_price_after_e6: position.entry_price_e6,
+        margin_after_e6: position.margin_e6,
+        size_delta_e6: -(close_size as i64),
+        realized_pnl_e6: realized_pnl,
+        fee_e6: fee,
+        related_trade_sequence: close_trade_event_seq,
+    });
+
+    emit_trade_event(&TradeEvent {
+        discriminator: event_discriminator::TRADE,
+        sequence: close_trade_event_seq,
+        timestamp: current_ts,
+        batch_id,
+        market_index,
+        market_type: 0,
+        trade_type: 0,
+        maker: Pubkey::default(),
+        maker_order_id: [0u8; 16],
+        maker_side: 0,
+        maker_fee_e6: 0,
+        taker: user,
+        taker_order_id: [0u8; 16],
+        taker_side: close_pre_side,
+        taker_fee_e6: fee as i64,
+        price_e6,
+        size_e6: close_size,
+        notional_e6: (close_size as u128 * price_e6 as u128 / 1_000_000) as u64,
+        maker_realized_pnl_e6: 0,
+        taker_realized_pnl_e6: realized_pnl,
+        maker_margin_delta_e6: 0,
+        taker_margin_delta_e6: -(margin_to_release as i64),
+    });
+
     Ok(())
 }
 
@@ -1563,6 +1695,9 @@ fn process_liquidate(
     ledger_config.total_liquidations += 1;
     ledger_config.last_update_ts = current_ts;
     let sequence = ledger_config.next_sequence();
+    let liq_pos_seq = ledger_config.next_sequence();
+    let liq_fee_seq = ledger_config.next_sequence();
+    let liq_ins_seq = ledger_config.next_sequence();
     ledger_config.serialize(&mut &mut ledger_config_info.data.borrow_mut()[..])?;
 
     // 更新用户统计
@@ -1603,12 +1738,58 @@ fn process_liquidate(
         related_trade_sequence: sequence,
     });
 
+    emit_position_event(&PositionEvent {
+        discriminator: event_discriminator::POSITION,
+        sequence: liq_pos_seq,
+        timestamp: current_ts,
+        user,
+        market_index,
+        event_type: 4,
+        side_before: side_u8,
+        size_before_e6: pre_liq_size,
+        entry_price_before_e6: pre_liq_entry,
+        margin_before_e6: margin,
+        side_after: side_u8,
+        size_after_e6: 0,
+        entry_price_after_e6: 0,
+        margin_after_e6: 0,
+        size_delta_e6: -(pre_liq_size as i64),
+        realized_pnl_e6: pnl,
+        fee_e6: liquidation_penalty,
+        related_trade_sequence: sequence,
+    });
+
+    if liquidation_penalty > 0 {
+        emit_fee_event(&FeeEvent {
+            discriminator: event_discriminator::FEE,
+            sequence: liq_fee_seq,
+            timestamp: current_ts,
+            user,
+            market_index,
+            fee_type: 2,
+            amount_e6: liquidation_penalty as i64,
+            related_trade_sequence: sequence,
+        });
+
+        emit_insurance_fund_event(&InsuranceFundEvent {
+            discriminator: event_discriminator::INSURANCE_FUND,
+            sequence: liq_ins_seq,
+            timestamp: current_ts,
+            event_type: 0,
+            market_index,
+            amount_e6: liquidation_penalty as i64,
+            balance_before_e6: 0,
+            balance_after_e6: 0,
+            related_user: user,
+            reason: 0,
+        });
+    }
+
     msg!(
         "Liquidation completed: user={}, market={}, mark_price={}, pnl={}, remainder={}, penalty={}, shortfall={}",
         user, market_index, mark_price_e6, pnl, user_remainder, liquidation_penalty, shortfall
     );
 
-    // 如果有穿仓且保险基金不足，需要触发 ADL
     if shortfall > 0 {
         msg!("⚠️ Shortfall detected: {}, ADL may be required if insurance fund insufficient", shortfall);
     }
@@ -2270,6 +2451,11 @@ fn process_admin_reset_position(
     // 读取并重置 Position
     let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
     
+    let reset_pre_side = position.side as u8;
+    let reset_pre_size = position.size_e6;
+    let reset_pre_entry = position.entry_price_e6;
+    let reset_pre_margin = position.margin_e6;
+
     msg!("🔧 Resetting Position: user={}, market={}, current_size={}", 
          user, market_index, position.size_e6);
     
@@ -2279,9 +2465,31 @@ fn process_admin_reset_position(
     position.entry_price_e6 = 0;
     position.liquidation_price_e6 = 0;
     position.unrealized_pnl_e6 = 0;
-    position.last_update_ts = get_current_timestamp()?;
+    let reset_ts = get_current_timestamp()?;
+    position.last_update_ts = reset_ts;
     
     position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+
+    emit_position_event(&PositionEvent {
+        discriminator: event_discriminator::POSITION,
+        sequence: 0,
+        timestamp: reset_ts,
+        user,
+        market_index,
+        event_type: 5,
+        side_before: reset_pre_side,
+        size_before_e6: reset_pre_size,
+        entry_price_before_e6: reset_pre_entry,
+        margin_before_e6: reset_pre_margin,
+        side_after: reset_pre_side,
+        size_after_e6: 0,
+        entry_price_after_e6: 0,
+        margin_after_e6: 0,
+        size_delta_e6: -(reset_pre_size as i64),
+        realized_pnl_e6: 0,
+        fee_e6: 0,
+        related_trade_sequence: 0,
+    });
 
     msg!("✅ Position reset to zero");
     Ok(())
@@ -2389,6 +2597,31 @@ fn process_record_spot_trade(
          sequence, user, market_index, if is_buy { "Buy" } else { "Sell" },
          base_amount_e6, quote_amount_e6, fee_e6);
 
+    emit_trade_event(&TradeEvent {
+        discriminator: event_discriminator::TRADE,
+        sequence,
+        timestamp: current_ts,
+        batch_id,
+        market_index: market_index as u8,
+        market_type: 1,
+        trade_type: 0,
+        maker: Pubkey::default(),
+        maker_order_id: [0u8; 16],
+        maker_side: 0,
+        maker_fee_e6: 0,
+        taker: user,
+        taker_order_id: [0u8; 16],
+        taker_side: if is_buy { 0 } else { 1 },
+        taker_fee_e6: fee_e6 as i64,
+        price_e6,
+        size_e6: base_amount_e6,
+        notional_e6: quote_amount_e6,
+        maker_realized_pnl_e6: 0,
+        taker_realized_pnl_e6: 0,
+        maker_margin_delta_e6: 0,
+        taker_margin_delta_e6: 0,
+    });
+
     Ok(())
 }
 
@@ -2470,6 +2703,31 @@ fn process_batch_record_spot_trades(
 
         spot_trade.serialize(&mut &mut spot_trade_info.data.borrow_mut()[..])?;
 
+        emit_trade_event(&TradeEvent {
+            discriminator: event_discriminator::TRADE,
+            sequence,
+            timestamp: current_ts,
+            batch_id,
+            market_index: trade.market_index as u8,
+            market_type: 1,
+            trade_type: 0,
+            maker: Pubkey::default(),
+            maker_order_id: [0u8; 16],
+            maker_side: 0,
+            maker_fee_e6: 0,
+            taker: trade.user,
+            taker_order_id: [0u8; 16],
+            taker_side: if trade.is_buy { 0 } else { 1 },
+            taker_fee_e6: trade.fee_e6 as i64,
+            price_e6: trade.price_e6,
+            size_e6: trade.base_amount_e6,
+            notional_e6: trade.quote_amount_e6,
+            maker_realized_pnl_e6: 0,
+            taker_realized_pnl_e6: 0,
+            maker_margin_delta_e6: 0,
+            taker_margin_delta_e6: 0,
+        });
+
         // 累加统计
         ledger_config.total_volume_e6 = ledger_config.total_volume_e6.saturating_add(trade.quote_amount_e6);
         ledger_config.total_fees_collected_e6 = ledger_config.total_fees_collected_e6.saturating_add(trade.fee_e6);
@@ -2532,6 +2790,45 @@ fn process_record_order_events(
     }
 
     msg!("✅ RecordOrderEvents: {} events emitted", events.len());
+    Ok(())
+}
+
+// ============================================================================
+// 资金费率事件存证
+// ============================================================================
+
+fn process_record_funding_events(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    events: Vec<FundingEventInput>,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let relayer = next_account_info(account_info_iter)?;
+    let _ledger_config_info = next_account_info(account_info_iter)?;
+    let relayer_config_info = next_account_info(account_info_iter)?;
+
+    assert_signer(relayer)?;
+
+    let relayer_config = deserialize_account::<RelayerConfig>(&relayer_config_info.data.borrow())?;
+    if !relayer_config.is_authorized(relayer.key) {
+        msg!("❌ Unauthorized relayer for RecordFundingEvents: {}", relayer.key);
+        return Err(LedgerError::UnauthorizedRelayer.into());
+    }
+
+    for input in &events {
+        msg!(
+            "EVENT:FundingSettlement:market={},rate={},price={},accounts={},total_paid={},epoch={},ts={}",
+            input.market_index,
+            input.funding_rate_e6,
+            input.index_price_e6,
+            input.accounts_settled,
+            input.total_funding_paid_e6,
+            input.epoch,
+            input.timestamp,
+        );
+    }
+
+    msg!("✅ RecordFundingEvents: {} events emitted", events.len());
     Ok(())
 }
 

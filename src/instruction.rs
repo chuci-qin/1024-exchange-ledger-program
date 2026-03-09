@@ -385,6 +385,23 @@ pub enum LedgerInstruction {
     RecordOrderEvents {
         events: Vec<OrderEventInput>,
     },
+
+    // ========================================================================
+    // 资金费率事件存证指令
+    // ========================================================================
+
+    /// 批量记录资金费率结算事件
+    ///
+    /// 由 Relayer 异步调用，将链下资金费率计算结果记录到链上日志。
+    /// 仅 emit 事件日志，不修改任何 PDA 状态。
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` LedgerConfig
+    /// 2. `[]` RelayerConfig
+    RecordFundingEvents {
+        events: Vec<FundingEventInput>,
+    },
 }
 
 /// 订单事件输入数据（由 Relayer 提交）
@@ -406,6 +423,23 @@ pub struct OrderEventInput {
     pub status: u8,
     /// StatusReason: 0=None, 8=UserCancelled, etc.
     pub status_reason: u8,
+    pub timestamp: i64,
+}
+
+/// 资金费率事件输入数据（由 Relayer 提交）
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct FundingEventInput {
+    pub market_index: u8,
+    /// Funding rate in e6 (can be negative)
+    pub funding_rate_e6: i64,
+    /// Index price at settlement time
+    pub index_price_e6: u64,
+    /// Number of accounts affected
+    pub accounts_settled: u32,
+    /// Total funding paid (positive = longs paid)
+    pub total_funding_paid_e6: i64,
+    /// Epoch/round identifier
+    pub epoch: u64,
     pub timestamp: i64,
 }
 

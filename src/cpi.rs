@@ -336,49 +336,6 @@ pub fn set_adl_in_progress<'a>(
     )
 }
 
-/// CPI: 添加交易手续费到保险基金 (Fund Program)
-///
-/// V1 简化方案: 交易手续费直接转入保险基金
-/// 
-/// 在 ClosePosition 执行后调用，将手续费从 Vault 转入 Insurance Fund
-pub fn add_trading_fee<'a>(
-    fund_program_id: &Pubkey,
-    caller_program: AccountInfo<'a>,
-    fund_account: AccountInfo<'a>,
-    insurance_config: AccountInfo<'a>,
-    vault_token_account: AccountInfo<'a>,
-    insurance_fund_vault: AccountInfo<'a>,
-    token_program: AccountInfo<'a>,
-    fee_e6: i64,
-    signer_seeds: &[&[&[u8]]],
-) -> ProgramResult {
-    let instruction = Instruction {
-        program_id: *fund_program_id,
-        accounts: vec![
-            AccountMeta::new_readonly(*caller_program.key, false),
-            AccountMeta::new(*fund_account.key, false),
-            AccountMeta::new(*insurance_config.key, false),
-            AccountMeta::new(*vault_token_account.key, false),
-            AccountMeta::new(*insurance_fund_vault.key, false),
-            AccountMeta::new_readonly(*token_program.key, false),
-        ],
-        data: FundInstruction::AddTradingFee { fee_e6 }.try_to_vec()?,
-    };
-
-    invoke_signed(
-        &instruction,
-        &[
-            caller_program,
-            fund_account,
-            insurance_config,
-            vault_token_account,
-            insurance_fund_vault,
-            token_program,
-        ],
-        signer_seeds,
-    )
-}
-
 // =============================================================================
 // Helper Functions
 // =============================================================================
